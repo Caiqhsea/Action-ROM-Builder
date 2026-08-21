@@ -54,14 +54,42 @@ jobs:
 
       # ============================================================
       # 2. 配置 12G swap，防止编译时 OOM
+      #    修复点：
+      #    - 不使用 fallocate（GitHub runner 上可能报 "Text file busy"）
+      #    - 不依赖 pierotofy/set-swap-space 第三方 action
+      #    - 用 dd 创建 swap 文件，兼容性更好
+      #    - 先 swapoff -a 关闭已有 swap，再 rm 清理旧文件
+      #    - /swapfile 失败时兜底到 /mnt/swapfile（数据盘空间更大）
       # ============================================================
-      - name: Configure 12GB swap
+      - name: Configure 12GB swap (dd with /mnt fallback)
         run: |
-          sudo fallocate -l 12G /swapfile
-          sudo chmod 600 /swapfile
-          sudo mkswap /swapfile
-          sudo swapon /swapfile
-          echo "Swap configured:"
+          # 关闭所有已有 swap（忽略错误）
+          sudo swapoff -a || true
+
+          # 清理可能残留的旧 swap 文件
+          sudo rm -f /swapfile /mnt/swapfile
+
+          SWAP_FILE=""
+
+          # 优先在根分区创建 swap
+          echo "Attempting to create swap at /swapfile ..."
+          if sudo dd if=/dev/zero of=/swapfile bs=1M count=12288 status=progress; then
+            SWAP_FILE="/swapfile"
+            echo "Successfully created /swapfile"
+          else
+            echo "dd on /swapfile failed, falling back to /mnt/swapfile ..."
+            sudo rm -f /swapfile
+            sudo dd if=/dev/zero of=/mnt/swapfile bs=1M count=12288 status=progress
+            SWAP_FILE="/mnt/swapfile"
+            echo "Successfully created /mnt/swapfile"
+          fi
+
+          # 设置权限、格式化、启用
+          sudo chmod 600 "$SWAP_FILE"
+          sudo mkswap "$SWAP_FILE"
+          sudo swapon "$SWAP_FILE"
+
+          echo "Swap configured at: $SWAP_FILE"
           free -h
 
       # ============================================================
