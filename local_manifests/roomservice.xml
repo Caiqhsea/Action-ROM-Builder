@@ -1,6 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest>
-    <remove-project name="ArrowOS/android_kernel_xiaomi_sky"/>
     <project name="ArrowOS-Devices/android_kernel_xiaomi_sky"
              path="kernel/xiaomi/sky"
              remote="github"
