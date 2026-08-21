@@ -61,15 +61,14 @@ jobs:
           distribution: temurin
           java-version: 11
 
-      - name: 安装依赖 & 多备用地址下载repo，无国内镜像/代理
+      - name: 安装依赖 + 国内镜像下载repo工具
         run: |
           sudo apt update -y
           sudo apt install git ccache python3 openssl curl -y
-          # 多备用官方地址循环下载repo，解决curl exit code 5
+          # 中科大国内repo镜像下载，不会被谷歌屏蔽
           download_repo() {
             rm -f repo
-            # 谷歌官方备用域名，无国内中转
-            curl -fL https://gerrit.googlesource.com/git-repo/+/refs/heads/main/repo?format=TEXT | base64 -d > repo
+            curl -fL https://mirrors.ustc.edu.cn/git/git-repo/git-repo/repo > repo
           }
           MAX_DL=3
           for ((i=1; i<=MAX_DL; i++)); do
@@ -86,10 +85,11 @@ jobs:
           fi
           chmod a+x repo
           sudo mv repo /usr/local/bin/
-          # git基础配置，彻底清空中科大镜像映射
+          # git全局配置：谷歌AOSP自动转发中科大国内源
           git config --global user.name "CI Builder"
           git config --global user.email "ci@build.local"
-          git config --global --unset-all url."https://mirrors.ustc.edu.cn/aosp/".insteadOf || true
+          # 核心：AOSP国内镜像映射
+          git config --global url."https://mirrors.ustc.edu.cn/aosp/".insteadOf https://android.googlesource.com/
           # ccache编译缓存
           mkdir -p ${{ env.workspace-folder }}/ccache
           echo "export USE_CCACHE=1" >> ~/.bashrc
@@ -97,8 +97,10 @@ jobs:
           ccache -M 50G
         working-directory: ${{ env.workspace-folder }}
 
-      - name: 初始化&同步源码（纯谷歌原生源，单线程低压力）
+      - name: 初始化&同步源码（国内中科大源，单线程防资源耗尽）
         run: |
+          # repo工具指定国内镜像地址，双重加速
+          export REPO_URL=https://mirrors.ustc.edu.cn/git/git-repo/git-repo
           cd ${{ env.workspace-folder }}
           mkdir -p arrow
           cd arrow
@@ -114,8 +116,8 @@ jobs:
               echo "✅ 源码同步完成"
               exit 0
             fi
-            echo "❌ 源访问限流，等待90秒超长冷却后重试"
-            sleep 90
+            echo "❌ 镜像限流，等待60秒冷却后重试"
+            sleep 60
           done
           echo "❌ 5次同步全部失败，任务终止"
           exit 1
