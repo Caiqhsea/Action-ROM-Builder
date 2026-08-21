@@ -36,7 +36,7 @@ jobs:
         with:
           path: repo-tmp
 
-      # 清理旧环境 + 扩容磁盘释放空间（解决磁盘资源耗尽）
+      # 清理无用文件扩容磁盘
       - name: 清理无用文件扩容磁盘
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost
@@ -50,7 +50,7 @@ jobs:
           cd workspace
           echo "workspace-folder=$(pwd)" >> $GITHUB_ENV
 
-      # 源码缓存修复：移除run_id，同分支复用缓存，大幅减少重复同步
+      # 源码缓存优化（移除run_id，复用缓存）
       - name: 缓存完整源码
         uses: actions/cache@v3
         with:
@@ -59,84 +59,82 @@ jobs:
           restore-keys: |
             arrowos-${{ github.event.inputs.MANIFEST_BRANCH }}
 
-      # Android12 强制JDK11
+      # Android12 JDK11
       - name: 配置JDK11
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: 11
 
-      # 安装系统依赖与Repo工具（中科大repo镜像加速下载repo）
+      # 安装依赖+Repo中科大镜像加速（仅repo工具，不代理源码）
       - name: 安装系统依赖与Repo工具
         run: |
           sudo apt update -y
           sudo apt install git ccache python3 openssl curl -y
-          # 中科大镜像加速repo工具下载，规避谷歌源超时
+          # 仅repo工具走中科大，源码github不代理
           export REPO_URL=https://gerrit-googlesource.proxy.ustclug.org/git-repo
           sudo curl -L -o /usr/local/bin/repo $REPO_URL/repo
           sudo chmod a+x /usr/local/bin/repo
-          # 全局git基础配置
+          # 全局Git基础配置
           git config --global user.name "CI Builder"
           git config --global user.email "ci@build.local"
-          # 配置ccache编译缓存
+          # 【仅修复AOSP 404，无任何github代理】
+          # 完整覆盖android.googlesource两种协议，统一正确中科大地址
+          git config --global url."https://mirrors.ustc.edu.cn/aosp/".insteadOf https://android.googlesource.com/
+          git config --global url."https://mirrors.ustc.edu.cn/aosp/".insteadOf git://android.googlesource.com/
+          # Ccache编译缓存
           mkdir -p ${{ env.workspace-folder }}/ccache
           echo "export USE_CCACHE=1" >> ~/.bashrc
           echo "export CCACHE_DIR=${{ env.workspace-folder }}/ccache" >> ~/.bashrc
           ccache -M 50G
         working-directory: ${{ env.workspace-folder }}
 
-      # 【核心修复】源码同步：修复中科大404、降并发、浅克隆、失败自动重试3次，解决RESOURCE_EXHAUSTED
-      - name: 初始化&同步源码（带限流保护+自动重试）
+      # 同步源码：浅克隆、低并发、三重重试，纯原生无代理
+      - name: 初始化&同步源码（仅AOSP镜像修复，无第三方代理）
         run: |
           cd ${{ env.workspace-folder }}
           mkdir -p arrow
           cd arrow
-          # 修复404：正确中科大AOSP镜像替换规则
-          git config --global url."https://mirrors.ustc.edu.cn/aosp/".insteadOf https://android.googlesource.com/
-          # --depth=1 浅克隆，只拉最新代码，减少90%流量，从根源降低资源占用
           repo init -u ${{ github.event.inputs.SYNC_URL }} -b ${{ github.event.inputs.MANIFEST_BRANCH }} --no-repo-verify --depth=1
           mkdir -p .repo/local_manifests
           cp ../../repo-tmp/local_manifests/roomservice.xml .repo/local_manifests/
           
-          # 同步失败自动重试逻辑，最多3次，每次失败休眠30秒规避限流
           MAX_RETRY=3
           for ((i=1; i<=MAX_RETRY; i++)); do
             echo "==================== 第$i次源码同步尝试 ===================="
-            # 并发降低至j2，防止大量并发触发服务器资源耗尽限流
-            repo sync -j2 --force-sync --no-tags --no-clone-bundle --verbose --retry-fetches=3
+            repo sync -j2 --force-sync --no-tags --no-clone-bundle --verbose --retry-fetches=5
             if [ $? -eq 0 ]; then
-              echo "✅ 源码同步全部完成，进入下一步"
+              echo "✅ 源码同步全部完成"
               exit 0
             fi
-            echo "❌ 同步触发限流/资源耗尽，等待30秒后重试"
-            sleep 30
+            echo "❌ 仓库访问失败/限流，等待40秒重试"
+            sleep 40
           done
-          echo "❌ 连续3次同步全部失败，终止构建任务"
+          echo "❌ 连续3次同步全部失败，终止构建"
           exit 1
         working-directory: ${{ env.workspace-folder }}
 
-      # 分配12G Swap交换内存，防止编译内存溢出
+      # 12G Swap内存防编译OOM
       - name: 分配12G Swap交换内存
         uses: pierotofy/set-swap-space@master
         with:
           swap-size-gb: 12
 
-      # 编译ROM（限制编译并发防止内存崩溃）
+      # 编译固定-j4，不使用nproc防止内存溢出
       - name: 编译Android12 ROM
         run: |
           cd ${{ env.workspace-folder }}/arrow
           source build/envsetup.sh
           lunch ${{ github.event.inputs.LUNCH_TARGET }}
-          # ubuntu-latest仅2核4线程，固定-j4，不使用nproc防止内存爆掉
           m otapackage -j4
         working-directory: ${{ env.workspace-folder }}
 
-      # 列出刷机包
+      # 查看刷机包
       - name: 查看编译产物
         run: |
           ls ${{ env.workspace-folder }}/arrow/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/*.zip
 
-      # 自动发布Release
+      # 发布Release
       - name: 发布刷机包到Release
         uses: softprops/action-gh-release@v1
         with:
