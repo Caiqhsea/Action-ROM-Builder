@@ -36,17 +36,6 @@ jobs:
         with:
           path: repo-tmp
 
-      # 权限校验：仅仓库所有者可编译
-      - name: 校验操作者权限
-        if: github.event.repository.owner.login == github.actor
-        run: echo "权限校验通过，开始编译流程"
-
-      - name: 非所有者终止任务
-        if: github.event.repository.owner.login != github.actor
-        run: |
-          echo "错误：仅仓库拥有者可运行编译任务"
-          exit 1
-
       # 清理旧环境残留
       - name: 清理旧环境
         uses: rokibhasansagar/slimhub_actions@main
@@ -65,18 +54,18 @@ jobs:
           path: ${{ env.workspace-folder }}/arrow
           key: arrowos-${{ github.event.inputs.MANIFEST_BRANCH }}-${{ github.run_id }}
 
-      # Android12 强制JDK11（高版本Java编译报错）
+      # Android12 强制JDK11
       - name: 配置JDK11
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: 11
 
-      # 安装安卓12全套编译依赖
+      # 安装系统依赖【已删除失效 python-is-python2】
       - name: 安装系统依赖与Repo工具
         run: |
           sudo apt update -y
-          sudo apt install git ccache python3 python-is-python2 openssl curl -y
+          sudo apt install git ccache python3 openssl curl -y
           # 安装官方repo工具
           sudo curl -L -o /usr/local/bin/repo https://storage.googleapis.com/git-repo-downloads/repo
           sudo chmod a+x /usr/local/bin/repo
@@ -87,30 +76,26 @@ jobs:
           ccache -M 50G
         working-directory: ${{ env.workspace-folder }}
 
-      # 源码同步【核心：无fastgit，仅AOSP中科大镜像加速】
+      # 源码同步（无fastgit，仅AOSP中科大镜像）
       - name: 初始化&同步源码（带实时日志）
         run: |
           cd ${{ env.workspace-folder }}
           mkdir -p arrow
           cd arrow
-          # 仅AOSP源码走国内中科大镜像，GitHub原生直连无跳转报错
           git config --global url."https://mirrors.ustc.edu.cn/git/aosp/".insteadOf https://android.googlesource.com/
-          # 初始化ROM源码
           repo init -u ${{ github.event.inputs.SYNC_URL }} -b ${{ github.event.inputs.MANIFEST_BRANCH }} --no-repo-verify
-          # 复制本地内核配置roomservice.xml
           mkdir -p .repo/local_manifests
           cp ../../repo-tmp/local_manifests/roomservice.xml .repo/local_manifests/
-          # 4线程同步，打印完整实时日志，容错重试
           repo sync -j4 --force-sync --no-tags --no-clone-bundle --verbose
         working-directory: ${{ env.workspace-folder }}
 
-      # 分配12G虚拟内存，解决大源码编译内存溢出
+      # 分配12G Swap交换内存
       - name: 分配12G Swap交换内存
         uses: pierotofy/set-swap-space@master
         with:
           swap-size-gb: 12
 
-      # 编译ArrowOS刷机包
+      # 编译ROM
       - name: 编译Android12 ROM
         run: |
           cd ${{ env.workspace-folder }}/arrow
@@ -120,12 +105,12 @@ jobs:
         working-directory: ${{ env.workspace-folder }}
         continue-on-error: true
 
-      # 列出编译完成的刷机包
+      # 列出刷机包
       - name: 查看编译产物
         run: |
           ls ${{ env.workspace-folder }}/arrow/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/*.zip
 
-      # 自动上传刷机包至Release页面
+      # 自动发布Release
       - name: 发布刷机包到Release
         uses: softprops/action-gh-release@v1
         with:
@@ -134,7 +119,7 @@ jobs:
           name: ${{ github.event.inputs.DEVICE_NAME }} Android12 Build #${{ github.run_id }}
           body: |
             ROM版本：ArrowOS 12.1 (Android 12)
-            内核基线：Linux 5.10 LTS（自动更新小版本至5.10.226+）
+            内核基线：Linux 5.10 LTS
             设备代号：${{ github.event.inputs.DEVICE_NAME }}
             编译类型: userdebug
         env:
