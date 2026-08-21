@@ -109,15 +109,18 @@ jobs:
 
           export REPO_URL=$OFFICIAL_REPO
           echo "【第一步】优先谷歌官方repo，2秒连通检测..."
-          # 超时改为2秒，更快切换镜像
           if curl --connect-timeout 2 -sI $OFFICIAL_REPO > /dev/null; then
             echo "官方repo访问正常，使用原生源"
           else
             echo "官方直连超时，切换清华repo镜像"
             export REPO_URL=$TUNA_REPO
+            # 全局强制替换谷歌AOSP域名，拦截所有git谷歌请求
+            git config --global url."https://mirrors.tuna.tsinghua.edu.cn/git/AOSP/".insteadOf https://android.googlesource.com/
+            git config --global url."https://mirrors.tuna.tsinghua.edu.cn/git/AOSP/".insteadOf git://android.googlesource.com/
             if ! curl --connect-timeout 2 -sI $TUNA_REPO > /dev/null; then
               echo "清华镜像失效，降级中科大repo"
               export REPO_URL=$USTC_REPO
+              git config --global url."https://mirrors.ustc.edu.cn/aosp/".insteadOf https://android.googlesource.com/
             fi
           fi
           echo "最终生效REPO源：$REPO_URL"
@@ -149,35 +152,35 @@ jobs:
           TUNA_AOSP=https://mirrors.tuna.tsinghua.edu.cn/git/AOSP
           USTC_AOSP=https://mirrors.ustc.edu.cn/aosp
 
-          echo "【第一步】优先谷歌官方AOSP，2秒连通检测..."
+          echo "【第一步】优先纯谷歌官方原生AOSP直连，检测连通..."
           if curl --connect-timeout 2 -sI $OFFICIAL_AOSP > /dev/null; then
             echo "官方AOSP直连正常，保留原生地址不替换"
           else
-            echo "官方直连超时，切换清华国内镜像"
+            echo "官方直连超时无法访问，二次替换清单xml为清华镜像"
             find .repo/manifests -name "*.xml" -exec sed -i "s|$OFFICIAL_AOSP|$TUNA_AOSP|g" {} +
             if ! curl --connect-timeout 2 -sI $TUNA_AOSP > /dev/null; then
               echo "清华镜像不可用，降级中科大AOSP"
               find .repo/manifests -name "*.xml" -exec sed -i "s|$TUNA_AOSP|$USTC_AOSP|g" {} +
             fi
           fi
+          echo "清单fetch地址预览："
           grep -r "fetch=" .repo/manifests/*.xml | head -10 || true
 
-      # 9. 高速同步源码：去掉代理、降低并发-j8、增加稳定参数
-      - name: Repo sync (无代理稳定同步)
+      # 9. 高速稳定同步源码，降低并发+自动重试
+      - name: Repo sync (高速并发同步)
         run: |
           cd "$BUILD_DIR"
           for i in 1 2 3; do
             echo "===== 第$i次同步源码 ====="
-            # -j8 更适配Action带宽，--retry-fetches 自动重试拉取失败仓库
-            if repo sync -c -j8 --force-sync --no-tags --no-clone-bundle --prune --optimized-fetch --retry-fetches 3; then
-              echo "源码同步完成"
+            if repo sync -c -j6 --force-sync --no-tags --no-clone-bundle --prune --optimized-fetch --retry-fetches 5; then
+              echo "源码同步完成！"
               break
             fi
             if [ "$i" -eq 3 ]; then
-              echo "3次同步全部失败，终止任务"
+              echo "三次同步全部失败，终止构建"
               exit 1
             fi
-            echo "同步异常，等待45秒重试"
+            echo "同步失败，等待45秒后重试"
             sleep 45
           done
           if [ ! -f "build/envsetup.sh" ]; then
