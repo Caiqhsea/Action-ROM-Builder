@@ -53,9 +53,9 @@ jobs:
         uses: actions/cache@v3
         with:
           path: ${{ env.workspace-folder }}/arrow
-          key: arrow-${{ github.inputs.MIRROR }}-${{ github.inputs.MANIFEST_BRANCH }}
+          key: arrow-${{ github.event.inputs.MIRROR }}-${{ github.event.inputs.MANIFEST_BRANCH }}
           restore-keys: |
-            arrow-${{ github.inputs.MIRROR }}-
+            arrow-${{ github.event.inputs.MIRROR }}-
 
       - name: 配置JDK11（Android12强制依赖）
         uses: actions/setup-java@v4
@@ -72,8 +72,8 @@ jobs:
           git config --global safe.directory "*"
           git config --global core.longpaths true
 
-          # 镜像地址修正（修复中科大repo失效地址）
-          if [[ "${{ github.inputs.MIRROR }}" == "ustc" ]]; then
+          # 镜像地址修正
+          if [[ "${{ github.event.inputs.MIRROR }}" == "ustc" ]]; then
             export REPO_DL=https://mirrors.ustc.edu.cn/git/git-repo/repo
             export AOSP_MIRROR=https://mirrors.ustc.edu.cn/aosp/
             export REPO_URL=https://mirrors.ustc.edu.cn/git/git-repo
@@ -107,15 +107,21 @@ jobs:
       - name: 初始化&同步源码（无额外参数，规避git拦截）
         run: |
           export REPO_URL=${{ env.REPO_URL }}
+          SYNC_URL="${{ github.event.inputs.SYNC_URL }}"
+          BRANCH="${{ github.event.inputs.MANIFEST_BRANCH }}"
+
+          echo "Manifest地址: $SYNC_URL"
+          echo "分支: $BRANCH"
+
           cd ${{ env.workspace-folder }}
           rm -rf arrow
           mkdir arrow
           cd arrow
-          # 核心修复：repo init 只保留 -u，删除所有额外参数避免被git拦截
-          repo init -u ${{ github.inputs.SYNC_URL }}
-          # 手动切分支
+
+          # 单独变量赋值，保证参数能正常传入repo init
+          repo init -u "$SYNC_URL"
           cd .repo/manifests
-          git checkout ${{ github.inputs.MANIFEST_BRANCH }}
+          git checkout "$BRANCH"
           cd ../../
 
           # 加载本地设备树xml
@@ -154,19 +160,19 @@ jobs:
           cd ${{ env.workspace-folder }}/arrow
           ls -la
           source build/envsetup.sh
-          lunch ${{ github.inputs.LUNCH_TARGET }}
+          lunch ${{ github.event.inputs.LUNCH_TARGET }}
           m otapackage -j4
 
       - name: 列出编译输出刷机包
-        run: ls ${{ env.workspace-folder }}/arrow/out/target/product/${{ github.inputs.DEVICE_NAME }}/*.zip
+        run: ls ${{ env.workspace-folder }}/arrow/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/*.zip
 
       - name: 自动发布构建包Release
         uses: softprops/action-gh-release@v1
         with:
-          files: ${{ env.workspace-folder }}/arrow/out/target/product/${{ github.inputs.DEVICE_NAME }}/*.zip
-          tag_name: build-${{ github.inputs.MIRROR }}-${{ github.run_id }}
-          name: ${{ github.inputs.DEVICE_NAME }} Android12 构建 #${{ github.run_id }}
+          files: ${{ env.workspace-folder }}/arrow/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/*.zip
+          tag_name: build-${{ github.event.inputs.MIRROR }}-${{ github.run_id }}
+          name: ${{ github.event.inputs.DEVICE_NAME }} Android12 构建 #${{ github.run_id }}
           body: |
-            构建镜像源：${{ github.inputs.MIRROR == 'ustc' && '中科大USTC' || '清华TUNA' }}
-            设备代号：${{ github.inputs.DEVICE_NAME }}
-            源码分支：${{ github.inputs.MANIFEST_BRANCH }}
+            构建镜像源：${{ github.event.inputs.MIRROR == 'ustc' && '中科大USTC' || '清华TUNA' }}
+            设备代号：${{ github.event.inputs.DEVICE_NAME }}
+            源码分支：${{ github.event.inputs.MANIFEST_BRANCH }}
