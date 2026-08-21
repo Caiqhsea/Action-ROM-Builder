@@ -19,10 +19,6 @@ on:
         description: 'Lunch target'
         required: true
         default: 'arrow_sky-userdebug'
-      aosp_mirror:
-        description: 'AOSP source mirror: tuna / ustc / official'
-        required: true
-        default: 'tuna'
 
 env:
   BUILD_DIR: ${{ github.workspace }}/android
@@ -34,7 +30,7 @@ jobs:
     timeout-minutes: 600
 
     steps:
-      # 0. 检出仓库（包含 local_manifests/roomservice.xml）
+      # 0. 检出仓库
       - name: Checkout repository
         uses: actions/checkout@v4
 
@@ -48,7 +44,7 @@ jobs:
           sudo apt-get clean
           df -h
 
-      # 2. 配置12G Swap，彻底规避fallocate占用报错
+      # 2. 12G Swap分区
       - name: Configure 12GB swap (dd with /mnt fallback)
         run: |
           sudo swapoff -a || true
@@ -68,39 +64,32 @@ jobs:
           echo "Swap文件：$SWAP_FILE"
           free -h
 
-      # 3. JDK11 安卓12强制依赖
+      # 3. JDK11
       - name: Setup JDK 11
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '11'
 
-      # 4. 修复 lib32ncurses5-dev 不存在报错，仅替换该包名
+      # 4. 编译依赖安装
       - name: Install build dependencies and repo
         run: |
-          # 加入Ubuntu22.04源，提供ncurses5兼容库
           echo "deb http://archive.ubuntu.com/ubuntu jammy main universe" | sudo tee /etc/apt/sources.list.d/jammy.list
           sudo apt-get update
-
-          # 完整编译依赖：lib32ncurses5-dev → lib32ncurses-dev
           sudo apt-get install -y \
             git-core gnupg flex bison build-essential zip curl \
             zlib1g-dev libc6-dev-i386 libncurses6 libncurses5 lib32ncurses-dev \
             x11proto-core-dev libx11-dev lib32z1-dev libgl1-mesa-dev \
             libxml2-utils xsltproc unzip fontconfig ccache rsync --allow-downgrades
-
-          # repo工具安装兜底逻辑，彻底规避curl下载404
           if ! sudo apt-get install -y repo; then
-            echo "apt无repo包，添加git-core PPA"
             sudo add-apt-repository -y ppa:git-core/ppa
             sudo apt-get update
             sudo apt-get install -y repo
           fi
-
           repo version
           git --version
 
-      # 5. Git全局配置
+      # 5. Git基础配置
       - name: Configure git
         run: |
           git config --global user.name "GitHub Actions"
@@ -109,18 +98,38 @@ jobs:
           git config --global core.longpaths true
           git config --global safe.directory "*"
 
-      # 6. Repo初始化，规避-b参数拦截问题
-      - name: Repo init (without -b to avoid git pathname block)
+      # 6. Repo初始化逻辑：先官方原生源，失败再切国内清华repo
+      - name: Repo init (先官方直连，失败切换国内镜像)
         run: |
+          # 原生官方repo地址
+          OFFICIAL_REPO=https://gerrit.googlesource.com/git-repo
+          TUNA_REPO=https://mirrors.tuna.tsinghua.edu.cn/git/git-repo
+          USTC_REPO=https://mirrors.ustc.edu.cn/git/git-repo
+
+          # 第一步：先纯原生官方直连
+          export REPO_URL=$OFFICIAL_REPO
+          echo "【第一步】优先使用谷歌官方repo原生直连，连通检测..."
+          if curl --connect-timeout 3 -sI $OFFICIAL_REPO > /dev/null; then
+            echo "官方repo源访问正常，使用原生源"
+          else
+            echo "官方直连超时失败，切换国内清华repo镜像"
+            export REPO_URL=$TUNA_REPO
+            if ! curl --connect-timeout 3 -sI $TUNA_REPO > /dev/null; then
+              echo "清华repo镜像不可用，降级中科大repo"
+              export REPO_URL=$USTC_REPO
+            fi
+          fi
+          echo "最终生效REPO源：$REPO_URL"
+
           mkdir -p "$BUILD_DIR"
           cd "$BUILD_DIR"
-          repo init -u "${{ github.event.inputs.manifest_url }}" --depth=1
+          repo init -u "${{ github.event.inputs.manifest_url }}" --depth=1 --no-repo-verify
           cd .repo/manifests
           git fetch origin "${{ github.event.inputs.branch }}"
           git checkout "${{ github.event.inputs.branch }}"
           echo "当前Manifest分支：$(git branch --show-current)"
 
-      # 7. 复制设备roomservice.xml本地清单
+      # 7. 导入设备本地清单
       - name: Copy local manifests
         run: |
           if [ -d "${{ github.workspace }}/local_manifests" ]; then
@@ -128,46 +137,56 @@ jobs:
             cp -v "${{ github.workspace }}/local_manifests/"*.xml "$BUILD_DIR/.repo/local_manifests/"
             ls -la "$BUILD_DIR/.repo/local_manifests/"
           else
-            echo "警告：仓库根目录未找到local_manifests文件夹，请确认roomservice.xml存在"
+            echo "警告：未检测到local_manifests文件夹"
           fi
 
-      # 8. AOSP国内镜像加速
-      - name: Apply AOSP mirror
+      # 8. AOSP源码镜像：先纯谷歌原生直网址，不通再切国内清华
+      - name: Apply AOSP mirror (先原生官方直连，失败切换国内源)
         run: |
           cd "$BUILD_DIR"
-          MIRROR="${{ github.event.inputs.aosp_mirror }}"
-          if [ "$MIRROR" = "tuna" ]; then
-            find .repo/manifests -name "*.xml" -exec sed -i 's|https://android.googlesource.com|https://mirrors.tuna.tsinghua.edu.cn/git/AOSP|g' {} +
-          elif [ "$MIRROR" = "ustc" ]; then
-            find .repo/manifests -name "*.xml" -exec sed -i 's|https://android.googlesource.com|https://mirrors.ustc.edu.cn/aosp|g' {} +
-          else
-            echo "使用官方AOSP源"
-          fi
-          grep -r "fetch=" .repo/manifests/*.xml | head -20 || true
+          # 原生谷歌直链
+          OFFICIAL_AOSP=https://android.googlesource.com
+          # 国内镜像
+          TUNA_AOSP=https://mirrors.tuna.tsinghua.edu.cn/git/AOSP
+          USTC_AOSP=https://mirrors.ustc.edu.cn/aosp
 
-      # 9. 源码同步，3次自动重试
-      - name: Repo sync (with 3 retries and integrity check)
+          echo "【第一步】优先纯谷歌官方原生AOSP直连，检测连通..."
+          if curl --connect-timeout 3 -sI $OFFICIAL_AOSP > /dev/null; then
+            echo "官方AOSP直连正常，保留原生地址不替换"
+          else
+            echo "官方直连超时无法访问，切换清华国内镜像"
+            find .repo/manifests -name "*.xml" -exec sed -i "s|$OFFICIAL_AOSP|$TUNA_AOSP|g" {} +
+            # 清华镜像失效则继续切中科大
+            if ! curl --connect-timeout 3 -sI $TUNA_AOSP > /dev/null; then
+              echo "清华镜像不可用，降级中科大AOSP"
+              find .repo/manifests -name "*.xml" -exec sed -i "s|$TUNA_AOSP|$USTC_AOSP|g" {} +
+            fi
+          fi
+          grep -r "fetch=" .repo/manifests/*.xml | head -10 || true
+
+      # 9. 高速同步源码：j16并发，重试3次
+      - name: Repo sync (高速并发同步)
         run: |
           cd "$BUILD_DIR"
           for i in 1 2 3; do
             echo "===== 第$i次同步源码 ====="
-            if repo sync -c -j4 --force-sync --no-tags --no-clone-bundle; then
-              echo "同步成功"
+            if repo sync -c -j16 --force-sync --no-tags --no-clone-bundle --prune --optimized-fetch; then
+              echo "源码同步完成"
               break
             fi
             if [ "$i" -eq 3 ]; then
-              echo "3次同步全部失败，退出"
+              echo "3次同步全部失败，终止任务"
               exit 1
             fi
-            echo "同步失败，等待30秒重试"
+            echo "同步异常，等待30秒重试"
             sleep 30
           done
           if [ ! -f "build/envsetup.sh" ]; then
-            echo "源码不完整，缺少build/envsetup.sh"
+            echo "源码同步不完整，缺少核心文件"
             exit 1
           fi
 
-      # 10. Ccache编译缓存加速
+      # 10. 编译缓存配置
       - name: Setup ccache
         run: |
           mkdir -p "$CCACHE_DIR"
@@ -176,7 +195,7 @@ jobs:
           ccache -M 50G
           ccache -z
 
-      # 11. 编译ROM
+      # 11. 编译刷机包
       - name: Build ArrowOS
         run: |
           cd "$BUILD_DIR"
@@ -187,7 +206,7 @@ jobs:
           lunch "${{ github.event.inputs.lunch_target }}"
           m otapackage -j4
 
-      # 12. 检索编译输出刷机包
+      # 12. 查找输出刷机包
       - name: Find output OTA zip
         id: find_zip
         run: |
@@ -203,7 +222,7 @@ jobs:
           echo "找到刷机包：$ZIP_PATH"
           ls -lh "$ZIP_PATH"
 
-      # 13. 自动发布Release
+      # 13. 上传至Release
       - name: Upload OTA zip to Release
         uses: softprops/action-gh-release@v2
         with:
