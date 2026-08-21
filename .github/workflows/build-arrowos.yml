@@ -67,15 +67,16 @@ jobs:
         run: |
           sudo apt update -y
           sudo apt install git ccache python3 openssl curl -y
-          # 全局放开git路径拦截，修复 strange pathname '-b' blocked
+          # 彻底放开git安全路径拦截
           git config --global core.protectNTFS false
           git config --global safe.directory "*"
+          git config --global core.longpaths true
 
-          # 自动切换镜像
+          # 镜像地址修正（修复中科大repo失效地址）
           if [[ "${{ github.inputs.MIRROR }}" == "ustc" ]]; then
-            export REPO_DL=https://mirrors.ustc.edu.cn/git/git-repo/git-repo/repo
+            export REPO_DL=https://mirrors.ustc.edu.cn/git/git-repo/repo
             export AOSP_MIRROR=https://mirrors.ustc.edu.cn/aosp/
-            export REPO_URL=https://mirrors.ustc.edu.cn/git/git-repo/git-repo
+            export REPO_URL=https://mirrors.ustc.edu.cn/git/git-repo
           else
             export REPO_DL=https://mirrors.tuna.tsinghua.edu.cn/git/git-repo
             export AOSP_MIRROR=https://mirrors.tuna.tsinghua.edu.cn/git/AOSP/
@@ -96,32 +97,32 @@ jobs:
           chmod +x repo
           sudo mv repo /usr/local/bin/
 
-          # AOSP源码全部转发国内镜像
+          # AOSP源码镜像转发
           git config --global user.name "CI Builder"
           git config --global user.email "builder@action.local"
           git config --global url."$AOSP_MIRROR".insteadOf https://android.googlesource.com/
           echo "export REPO_URL=$REPO_URL" >> ~/.bashrc
         working-directory: ${{ env.workspace-folder }}
 
-      - name: 初始化&同步源码（修复-b参数报错）
+      - name: 初始化&同步源码（无额外参数，规避git拦截）
         run: |
           export REPO_URL=${{ env.REPO_URL }}
           cd ${{ env.workspace-folder }}
-          # 强制清空旧损坏目录，避免缓存冲突
           rm -rf arrow
           mkdir arrow
           cd arrow
-          # 移除 -b 参数，单独手动切分支，彻底解决 '-b' blocked 报错
-          repo init -u ${{ github.inputs.SYNC_URL }} --no-repo-verify
+          # 核心修复：repo init 只保留 -u，删除所有额外参数避免被git拦截
+          repo init -u ${{ github.inputs.SYNC_URL }}
+          # 手动切分支
           cd .repo/manifests
           git checkout ${{ github.inputs.MANIFEST_BRANCH }}
           cd ../../
 
-          # 加载本地设备树清单
+          # 加载本地设备树xml
           mkdir -p .repo/local_manifests
-          cp ../../repo-tmp/local_manifests/roomservice.xml .repo/local_manifests/
+          cp -f ../../repo-tmp/local_manifests/roomservice.xml .repo/local_manifests/
 
-          # 5轮同步重试，单线程防限流
+          # 5次同步重试，单线程防限流
           MAX_RETRY=5
           for ((i=1; i<=MAX_RETRY; i++)); do
             echo "===== 第$i次源码同步尝试 ====="
@@ -134,7 +135,7 @@ jobs:
             sleep 90
           done
 
-          # 校验源码完整性，防止 build/envsetup.sh 缺失
+          # 校验源码完整性，防止build/envsetup.sh缺失
           echo "当前源码根目录文件列表："
           ls -la
           if [ ! -f build/envsetup.sh ]; then
