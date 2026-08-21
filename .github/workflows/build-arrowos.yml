@@ -16,11 +16,11 @@ on:
         required: true
         default: 'device/xiaomi/sky'
       DEVICE_NAME:
-        description: 设备代号
+        description: '设备代号'
         required: true
         default: 'sky'
       MAKEFILE_NAME:
-        description: 编译午餐名称
+        description: '编译午餐名称'
         required: true
         default: 'arrow_sky'
 
@@ -71,13 +71,16 @@ jobs:
     - name: 初始化源码 + 加载roomservice清单同步设备源码
       run: |
         cd ${{ steps.pwd.outputs.workspace-folder }}
+        # 克隆当前仓库，读取仓库内的roomservice.xml清单文件
+        git clone https://github.com/${{ github.repository }} repo-tmp
         mkdir arrow
         cd arrow
         repo init -u ${{ github.event.inputs.SYNC_URL }} -b ${{ github.event.inputs.MANIFEST_BRANCH }}
-        # 复制仓库里的local_manifests清单，自动拉取设备树/内核/vendor
+        # 创建本地清单目录并拷贝roomservice
         mkdir -p .repo/local_manifests
-        cp ../../local_manifests/roomservice.xml .repo/local_manifests/
-        repo sync -j$(nproc)
+        cp ../repo-tmp/local_manifests/roomservice.xml .repo/local_manifests/
+        # 多线程快速同步源码，增加防冲突/提速参数
+        repo sync -j$(nproc) --force-sync --no-tags --no-clone-bundle
       working-directory: ${{ steps.pwd.outputs.workspace-folder }}
 
     - name: 分配12G交换内存
