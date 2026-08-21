@@ -67,12 +67,10 @@ jobs:
         run: |
           sudo apt update -y
           sudo apt install git ccache python3 openssl curl -y
-          # 放开git拦截
           git config --global core.protectNTFS false
           git config --global safe.directory "*"
           git config --global core.longpaths true
 
-          # 镜像环境变量
           if [[ "${{ github.event.inputs.MIRROR }}" == "ustc" ]]; then
             export AOSP_MIRROR=https://mirrors.ustc.edu.cn/aosp/
             export REPO_URL=https://mirrors.ustc.edu.cn/git/git-repo
@@ -82,36 +80,56 @@ jobs:
           fi
           echo "REPO_URL=$REPO_URL" >> $GITHUB_ENV
 
-          # 统一使用清华repo下载地址（永久可用，无404）
+          # 三段下载源：清华→中科大→谷歌直连，每个源重试5次，间隔8秒
           download_repo(){
             rm -f repo
-            curl -fL https://mirrors.tuna.tsinghua.edu.cn/git/git-repo/raw/main/repo -o repo
+            # 1.清华镜像 最多5次
+            echo "=== 尝试【清华镜像】下载repo，最多5次 ==="
+            for t in {1..5}; do
+              echo "清华第${t}次尝试"
+              curl -fL https://mirrors.tuna.tsinghua.edu.cn/git/git-repo/raw/main/repo -o repo
+              if [ -f repo ]; then return 0; fi
+              sleep 8
+            done
+            rm -f repo
+
+            # 2.中科大镜像 最多5次
+            echo "=== 清华全部失败，切换【中科大镜像】最多5次 ==="
+            for t in {1..5}; do
+              echo "中科大第${t}次尝试"
+              curl -fL https://mirrors.ustc.edu.cn/git/git-repo/raw/main/repo -o repo
+              if [ -f repo ]; then return 0; fi
+              sleep 8
+            done
+            rm -f repo
+
+            # 3.谷歌官方直连 最多5次
+            echo "=== 国内镜像全部失败，切换【谷歌直连】最多5次 ==="
+            for t in {1..5}; do
+              echo "谷歌直连第${t}次尝试"
+              curl -fL https://gerrit.googlesource.com/git-repo/+/refs/heads/main/repo?format=RAW -o repo
+              if [ -f repo ]; then return 0; fi
+              sleep 8
+            done
+            return 1
           }
-          # 重试3次下载repo工具
-          for i in {1..3}; do
-            if download_repo; then
-              echo "repo工具下载成功"
-              break
-            fi
-            echo "repo工具下载失败，等待30秒重试"
-            sleep 30
-          done
-          # 校验文件是否存在，不存在直接退出
-          if [ ! -f repo ]; then
-            echo "三次下载repo全部失败，终止构建"
+
+          # 执行下载
+          if ! download_repo; then
+            echo "ERROR：清华/中科大/谷歌直连各5次全部失败，终止构建"
             exit 1
           fi
+
           chmod +x repo
           sudo mv repo /usr/local/bin/
 
-          # AOSP源码替换镜像
           git config --global user.name "CI Builder"
           git config --global user.email "builder@action.local"
           git config --global url."$AOSP_MIRROR".insteadOf https://android.googlesource.com/
           echo "export REPO_URL=$REPO_URL" >> ~/.bashrc
         working-directory: ${{ env.workspace-folder }}
 
-      - name: 初始化&同步源码（规避git参数拦截）
+      - name: 初始化&同步源码
         run: |
           export REPO_URL=${{ env.REPO_URL }}
           SYNC_URL="${{ github.event.inputs.SYNC_URL }}"
@@ -130,24 +148,29 @@ jobs:
           git checkout "$BRANCH"
           cd ../../
 
-          # 加载本地设备树清单
           mkdir -p .repo/local_manifests
           cp -f ../../repo-tmp/local_manifests/roomservice.xml .repo/local_manifests/
 
-          # 同步重试机制
+          # 源码同步最多5次，间隔20秒
           MAX_RETRY=5
+          sync_ok=0
           for ((i=1; i<=MAX_RETRY; i++)); do
             echo "===== 第$i次源码同步 ====="
             repo sync -j1 --force-sync --no-tags --no-clone-bundle --retry-fetches=15
             if [ $? -eq 0 ]; then
               echo "✅ 源码同步完成"
+              sync_ok=1
               break
             fi
-            echo "同步失败，等待90s重试"
-            sleep 90
+            echo "同步失败，等待20s重试"
+            sleep 20
           done
 
-          # 校验源码完整性
+          if [ $sync_ok -ne 1 ]; then
+            echo "ERROR：5次源码同步全部失败，终止构建"
+            exit 1
+          fi
+
           ls -la
           if [ ! -f build/envsetup.sh ]; then
             echo "❌ 源码缺失 build/envsetup.sh"
