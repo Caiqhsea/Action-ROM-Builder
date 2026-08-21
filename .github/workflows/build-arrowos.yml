@@ -86,20 +86,24 @@ jobs:
         ccache -M 50G
       working-directory: ${{ steps.pwd.outputs.workspace-folder }}
 
-    # 初始化源码 + 仅AOSP中科大镜像加速（修复404报错）
-    - name: 初始化源码 + 同步源码
+    # 初始化源码 + fastgit加速Github + 中科大AOSP镜像 + verbose实时打印下载进度
+    - name: 初始化源码 + 同步源码（带实时下载日志）
       run: |
         cd ${{ steps.pwd.outputs.workspace-folder }}
         mkdir -p arrow
         cd arrow
+        # FastGit 加速GitHub，不会404找不到仓库
+        git config --global url."https://hub.fastgit.xyz/".insteadOf https://github.com/
+        # 中科大镜像加速AOSP官方源码
+        git config --global url."https://mirrors.ustc.edu.cn/git/aosp/".insteadOf https://android.googlesource.com/
+
         repo init -u ${{ github.event.inputs.SYNC_URL }} -b ${{ github.event.inputs.MANIFEST_BRANCH }}
         # 拷贝本地roomservice设备清单
         mkdir -p .repo/local_manifests
         cp ../../repo-tmp/local_manifests/roomservice.xml .repo/local_manifests/
-        # 仅AOSP官方源码走镜像，GitHub仓库不镜像，避免404
-        git config --global url."https://mirrors.ustc.edu.cn/git/aosp/".insteadOf https://android.googlesource.com/
-        # 限制8线程，避免网络拥堵断连
-        repo sync -j8 --force-sync --no-tags --no-clone-bundle
+
+        # --verbose 实时输出每一个仓库下载进度，看得见下载动作
+        repo sync -j4 --force-sync --no-tags --no-clone-bundle --verbose
       working-directory: ${{ steps.pwd.outputs.workspace-folder }}
 
     # 分配12G虚拟内存，防止编译内存溢出崩溃
