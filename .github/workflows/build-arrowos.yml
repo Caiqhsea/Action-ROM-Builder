@@ -12,11 +12,11 @@ on:
           - ustc
           - tuna
       SYNC_URL:
-        description: ArrowOS Manifest仓库（必须带.git后缀）
+        description: ArrowOS Manifest仓库（固定无需修改）
         required: true
         default: https://github.com/ArrowOS/android_manifest.git
       MANIFEST_BRANCH:
-        description: Android12 固定分支 arrow-12.1
+        description: Android12源码分支 arrow-12.1
         required: true
         default: arrow-12.1
       DEVICE_NAME:
@@ -24,7 +24,7 @@ on:
         required: true
         default: sky
       LUNCH_TARGET:
-        description: lunch 编译目标
+        description: Android12编译目标 arrow_sky-userdebug
         required: true
         default: arrow_sky-userdebug
 
@@ -34,22 +34,22 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: 拉取本地roomservice配置
+      - name: 拉取本地roomservice设备配置
         uses: actions/checkout@v4
         with:
           path: repo-tmp
 
-      - name: 深度清理系统磁盘
+      - name: 清理磁盘空间
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /var/lib/apt/lists/*
           sudo apt clean
 
-      - name: 初始化工作目录
+      - name: 创建编译工作目录
         run: |
           mkdir workspace
           echo "workspace-folder=$(pwd)/workspace" >> $GITHUB_ENV
 
-      - name: 源码缓存持久化
+      - name: 源码缓存加速（减少重复同步）
         uses: actions/cache@v3
         with:
           path: ${{ env.workspace-folder }}/arrow
@@ -57,13 +57,13 @@ jobs:
           restore-keys: |
             arrow-${{ github.event.inputs.MIRROR }}-
 
-      - name: 配置JDK11（Android12强制依赖）
+      - name: 安装Android编译JDK11
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: 11
 
-      - name: 安装依赖 + 配置国内镜像源
+      - name: 环境依赖安装 + 多线路下载repo脚本
         run: |
           sudo apt update -y
           sudo apt install git ccache python3 openssl curl -y
@@ -71,6 +71,7 @@ jobs:
           git config --global safe.directory "*"
           git config --global core.longpaths true
 
+          # 切换国内AOSP镜像
           if [[ "${{ github.event.inputs.MIRROR }}" == "ustc" ]]; then
             export AOSP_MIRROR=https://mirrors.ustc.edu.cn/aosp/
             export REPO_URL=https://mirrors.ustc.edu.cn/git/git-repo
@@ -80,72 +81,68 @@ jobs:
           fi
           echo "REPO_URL=$REPO_URL" >> $GITHUB_ENV
 
-          # 四条下载链路：清华→中科大→Jsdelivr加速链→谷歌原生无参数链接，每条5次，间隔8秒
+          # 4条线路循环下载repo，每条重试5次
           download_repo(){
             rm -f repo
-            # 1.清华镜像 最多5次
-            echo "=== 尝试【清华镜像】下载repo，最多5次 ==="
+            # 1.清华镜像
+            echo "=== 尝试清华镜像下载repo ==="
             for t in {1..5}; do
-              echo "清华第${t}次尝试"
+              echo "第${t}次尝试清华源"
               curl -fL https://mirrors.tuna.tsinghua.edu.cn/git/git-repo/raw/main/repo -o repo
-              if [ -f repo ]; then return 0; fi
+              [ -f repo ] && return 0
               sleep 8
             done
             rm -f repo
 
-            # 2.中科大镜像 最多5次
-            echo "=== 清华全部失败，切换【中科大镜像】最多5次 ==="
+            # 2.中科大镜像
+            echo "=== 切换中科大镜像下载repo ==="
             for t in {1..5}; do
-              echo "中科大第${t}次尝试"
+              echo "第${t}次尝试中科大源"
               curl -fL https://mirrors.ustc.edu.cn/git/git-repo/raw/main/repo -o repo
-              if [ -f repo ]; then return 0; fi
+              [ -f repo ] && return 0
               sleep 8
             done
             rm -f repo
 
-            # 3.新增Jsdelivr全球加速链（兜底加速）最多5次
-            echo "=== 国内镜像失败，切换【Jsdelivr加速链】最多5次 ==="
+            # 3.jsdelivr全球加速
+            echo "=== 切换Jsdelivr加速下载repo ==="
             for t in {1..5}; do
-              echo "Jsdelivr加速第${t}次尝试"
+              echo "第${t}次尝试Jsdelivr"
               curl -fL https://cdn.jsdelivr.net/gh/GerritCodeReview/git-repo@main/repo -o repo
-              if [ -f repo ]; then return 0; fi
+              [ -f repo ] && return 0
               sleep 8
             done
             rm -f repo
 
-            # 4.谷歌官方原生链接（移除?format=RAW 避免400报错）最多5次
-            echo "=== 加速链失败，切换【谷歌原生直连】最多5次 ==="
+            # 4.谷歌官方源兜底
+            echo "=== 切换谷歌官方源下载repo ==="
             for t in {1..5}; do
-              echo "谷歌直连第${t}次尝试"
+              echo "第${t}次尝试谷歌源"
               curl -fL https://gerrit.googlesource.com/git-repo/+/refs/heads/main/repo -o repo
-              if [ -f repo ]; then return 0; fi
+              [ -f repo ] && return 0
               sleep 8
             done
-            return 1
+            echo "所有线路下载repo失败，终止任务"
+            exit 1
           }
 
-          # 执行下载逻辑
-          if ! download_repo; then
-            echo "ERROR：清华/中科大/Jsdelivr加速/谷歌直连 各5次全部失败，终止构建"
-            exit 1
-          fi
-
+          download_repo
           chmod +x repo
           sudo mv repo /usr/local/bin/
 
+          # git基础配置
           git config --global user.name "CI Builder"
           git config --global user.email "builder@action.local"
           git config --global url."$AOSP_MIRROR".insteadOf https://android.googlesource.com/
-          echo "export REPO_URL=$REPO_URL" >> ~/.bashrc
         working-directory: ${{ env.workspace-folder }}
 
-      - name: 初始化&同步源码
+      - name: 初始化源码 + 多轮同步重试
         run: |
           export REPO_URL=${{ env.REPO_URL }}
           SYNC_URL="${{ github.event.inputs.SYNC_URL }}"
           BRANCH="${{ github.event.inputs.MANIFEST_BRANCH }}"
 
-          echo "Manifest地址: $SYNC_URL"
+          echo "Manifest仓库地址: $SYNC_URL"
           echo "源码分支: $BRANCH"
 
           cd ${{ env.workspace-folder }}
@@ -153,63 +150,62 @@ jobs:
           mkdir arrow
           cd arrow
 
-          repo init -u "$SYNC_URL"
+          # 初始化指定安卓12分支
+          repo init -u "$SYNC_URL" -b "$BRANCH"
           cd .repo/manifests
           git checkout "$BRANCH"
           cd ../../
 
+          # 导入设备roomservice配置
           mkdir -p .repo/local_manifests
           cp -f ../../repo-tmp/local_manifests/roomservice.xml .repo/local_manifests/
 
-          # 源码同步最多5次，间隔20秒
+          # 同步源码最多重试5次
           MAX_RETRY=5
-          sync_ok=0
+          SYNC_SUCCESS=0
           for ((i=1; i<=MAX_RETRY; i++)); do
             echo "===== 第$i次源码同步 ====="
             repo sync -j1 --force-sync --no-tags --no-clone-bundle --retry-fetches=15
             if [ $? -eq 0 ]; then
-              echo "✅ 源码同步完成"
-              sync_ok=1
+              SYNC_SUCCESS=1
               break
             fi
-            echo "同步失败，等待20s重试"
+            echo "同步失败，等待20秒重试"
             sleep 20
           done
 
-          if [ $sync_ok -ne 1 ]; then
-            echo "ERROR：5次源码同步全部失败，终止构建"
+          if [ $SYNC_SUCCESS -ne 1 ]; then
+            echo "源码同步全部失败，退出编译"
             exit 1
           fi
 
-          ls -la
+          # 校验源码完整性
           if [ ! -f build/envsetup.sh ]; then
-            echo "❌ 源码缺失 build/envsetup.sh"
+            echo "源码缺失核心文件，终止任务"
             exit 1
           fi
-          echo "✅ 源码校验通过"
+          echo "源码同步校验完成"
 
-      - name: 分配12G Swap，防止编译内存溢出
+      - name: 分配12G虚拟内存，解决编译内存不足
         uses: pierotofy/set-swap-space@master
         with:
           swap-size-gb: 12
 
-      - name: 编译ROM
+      - name: 编译ArrowOS刷机包
         run: |
           cd ${{ env.workspace-folder }}/arrow
           source build/envsetup.sh
           lunch ${{ github.event.inputs.LUNCH_TARGET }}
           m otapackage -j4
 
-      - name: 列出刷机包
-        run: ls ${{ env.workspace-folder }}/arrow/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/*.zip
+      - name: 输出刷机包路径
+        run: ls ${{ env.workspace-folder }}/arrow/out/target/product/${{ env.DEVICE_NAME }}/*.zip
 
-      - name: 自动发布Release
+      - name: 自动上传编译成品到Release
         uses: softprops/action-gh-release@v1
+        if: success()
         with:
-          files: ${{ env.workspace-folder }}/arrow/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/*.zip
-          tag_name: build-${{ github.event.inputs.MIRROR }}-${{ github.run_id }}
-          name: ${{ github.event.inputs.DEVICE_NAME }} Android12 构建 #${{ github.run_id }}
-          body: |
-            镜像源：${{ github.event.inputs.MIRROR == 'ustc' && '中科大USTC' || '清华TUNA' }}
-            设备：${{ github.event.inputs.DEVICE_NAME }}
-            分支：${{ github.event.inputs.MANIFEST_BRANCH }}
+          files: ${{ env.workspace-folder }}/arrow/out/target/product/${{ env.DEVICE_NAME }}/*.zip
+          tag_name: Android12-ArrowOS-${{ github.run_number }}
+          name: ArrowOS12 Build ${{ github.run_number }}
+          generate_release_notes: true
