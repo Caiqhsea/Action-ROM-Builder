@@ -1,14 +1,6 @@
-<?xml version="1.0" encoding="UTF-8"?>
+<?xml version="1.0" encoding="utf-8"?>
 <manifest>
-    <!-- 国内镜像加速AOSP内核，不影响GitHub仓库 -->
-    <remote name="github" fetch="https://github.com/" />
-
-    <!-- 删除ROM自带默认内核，避免冲突 -->
     <remove-project name="ArrowOS/android_kernel_xiaomi_sky"/>
-
-    <!-- 锁定5.10大版本，自动更新5.10.226/227/228安全补丁 -->
-    <!-- revision="5.10-stable" = 只锁5.10主线，小版本自动更新 -->
-    <!-- 如需固定死5.10.226：修改为 revision="5.10.226" -->
     <project name="ArrowOS-Devices/android_kernel_xiaomi_sky"
              path="kernel/xiaomi/sky"
              remote="github"
