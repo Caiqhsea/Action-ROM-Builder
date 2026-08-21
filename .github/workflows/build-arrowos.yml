@@ -75,17 +75,17 @@ jobs:
           distribution: 'temurin'
           java-version: '11'
 
-      # 4. 核心修复：兼容Ubuntu24.04安装ncurses5旧库，解决找不到包报错
+      # 4. 修复 lib32ncurses5-dev 不存在报错，仅替换该包名
       - name: Install build dependencies and repo
         run: |
           # 加入Ubuntu22.04源，提供ncurses5兼容库
           echo "deb http://archive.ubuntu.com/ubuntu jammy main universe" | sudo tee /etc/apt/sources.list.d/jammy.list
           sudo apt-get update
 
-          # 完整编译依赖，强制安装ncurses5兼容包
+          # 完整编译依赖：lib32ncurses5-dev → lib32ncurses-dev
           sudo apt-get install -y \
             git-core gnupg flex bison build-essential zip curl \
-            zlib1g-dev libc6-dev-i386 libncurses6 libncurses5 lib32ncurses5-dev \
+            zlib1g-dev libc6-dev-i386 libncurses6 libncurses5 lib32ncurses-dev \
             x11proto-core-dev libx11-dev lib32z1-dev libgl1-mesa-dev \
             libxml2-utils xsltproc unzip fontconfig ccache rsync --allow-downgrades
 
