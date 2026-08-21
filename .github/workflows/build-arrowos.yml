@@ -1,43 +1,28 @@
 name: Build ArrowOS ROM
 
-
 on:
   workflow_dispatch:
     inputs:
       SYNC_URL:
-        description: 'SYNC_URL'
+        description: 'ArrowOS 源码仓库地址'
         required: true
         default: 'https://github.com/ArrowOS/android_manifest.git'
       MANIFEST_BRANCH:
-        description: 'MANIFEST_BRANCH'
+        description: '源码分支'
         required: true
         default: 'arrow-13.1'
-      DEVICE_TREE_URL:
-        description: 'DEVICE_TREE_URL'
-        required: true
-        default: 'https://github.com/1ndev-ui/ROM_CG65_device_tree.git'
-      DEVICE_TREE_BRANCH:
-        description: 'DEVICE_TREE_BRANCH'
-        required: true
-        default: 'arrowos-13.1'
       DEVICE_PATH:
-        description: 'DEVICE_PATH'
+        description: '设备树存放路径'
         required: true
-        default: 'device/vortex/CG65'
-      COMMON_TREE_URL:
-        description: 'COMMON_TREE_URL (if no common tree, leave blank)'
-        required: false
-      COMMON_PATH:
-        description: 'COMMON_PATH (if no common tree, leave blank)'
-        required: false
+        default: 'device/xiaomi/sky'
       DEVICE_NAME:
-        description: 'DEVICE_NAME'
+        description: 设备代号
         required: true
-        default: 'CG65'
+        default: 'sky'
       MAKEFILE_NAME:
-        description: 'MAKEFILE_NAME'
+        description: 编译午餐名称
         required: true
-        default: 'arrow_CG65'
+        default: 'arrow_sky'
 
 jobs:
   build-arrowos:
@@ -45,37 +30,37 @@ jobs:
     permissions:
       contents: write
     steps:
-    - name: Check if sender is repository owner
+    - name: 校验仓库所有者
       if: github.event.repository.owner.login == github.event.sender.login
-      run: |
-        echo "Sender is the repository owner"
-    - name: Not the repository owner
+      run: echo "校验通过，仓库所有者操作"
+
+    - name: 非所有者禁止运行
       if: github.event.repository.owner.login != github.event.sender.login
       run: |
-        echo "Sender is not the repository owner"
+        echo "仅仓库主人可触发编译"
         exit 1
 
-    - name: Cleanup
+    - name: 清理环境
       uses: rokibhasansagar/slimhub_actions@main
 
-    - name: Initialize workspace
+    - name: 创建工作目录
       run: |
         mkdir workspace
         cd workspace
         echo "workspace-folder=$(pwd)" >> $GITHUB_OUTPUT
       id: pwd
       
-    - name: Setup Java
+    - name: 配置Java22
       uses: actions/setup-java@v4
       with:
         distribution: 'oracle'
         java-version: 22
       
-    - name: Prepare the build environment
+    - name: 安装编译依赖 & 配置repo/ccache
       run: |
         cd ${{ steps.pwd.outputs.workspace-folder }}
         sudo apt install git aria2 ccache -y
-        sudo curl --create-dirs -L -o /usr/local/bin/repo -O -L https://storage.googleapis.com/git-repo-downloads/repo
+        sudo curl --create-dirs -L -o /usr/local/bin/repo https://storage.googleapis.com/git-repo-downloads/repo
         sudo chmod a+rx /usr/local/bin/repo
         mkdir ${{ steps.pwd.outputs.workspace-folder }}/ccache
         export USE_CCACHE=1
@@ -83,36 +68,24 @@ jobs:
         ccache -M 50G
       working-directory: ${{ steps.pwd.outputs.workspace-folder }}
 
-    - name: Clone and sync ArrowOS sources
+    - name: 初始化源码 + 加载roomservice清单同步设备源码
       run: |
         cd ${{ steps.pwd.outputs.workspace-folder }}
         mkdir arrow
         cd arrow
         repo init -u ${{ github.event.inputs.SYNC_URL }} -b ${{ github.event.inputs.MANIFEST_BRANCH }}
-        repo sync
+        # 复制仓库里的local_manifests清单，自动拉取设备树/内核/vendor
+        mkdir -p .repo/local_manifests
+        cp ../../local_manifests/roomservice.xml .repo/local_manifests/
+        repo sync -j$(nproc)
       working-directory: ${{ steps.pwd.outputs.workspace-folder }}
 
-    - name: Clone device tree
-      run: |
-        cd ${{ steps.pwd.outputs.workspace-folder }}/arrow/
-        git clone ${{ github.event.inputs.DEVICE_TREE_URL }} -b ${{ github.event.inputs.DEVICE_TREE_BRANCH }} ./${{ github.event.inputs.DEVICE_PATH }}
-      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
-
-    - name: Clone common tree
-      if: |
-        github.event.inputs.COMMON_TREE_URL != null
-        && github.event.inputs.COMMON_PATH != null
-      run: |
-        cd ${{ steps.pwd.outputs.workspace-folder }}/arrow/
-        git clone ${{ github.event.inputs.COMMON_TREE_URL }} -b ${{ github.event.inputs.DEVICE_TREE_BRANCH }} ./${{ github.event.inputs.COMMON_PATH }}
-      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
-
-    - name: Set Swap Space
+    - name: 分配12G交换内存
       uses: pierotofy/set-swap-space@master
       with:
         swap-size-gb: 12
 
-    - name: Build ArrowOS ROM
+    - name: 编译ArrowOS安装包
       run: |
         cd ${{ steps.pwd.outputs.workspace-folder }}/arrow/
         . build/envsetup.sh
@@ -121,22 +94,22 @@ jobs:
       working-directory: ${{ steps.pwd.outputs.workspace-folder }}
       continue-on-error: true
 
-    - name: Check the output directory before uploading
+    - name: 查看编译输出文件
       run: |
         ls -al ${{ steps.pwd.outputs.workspace-folder }}/arrow/out/target/product/
-        echo
+        echo "===== 设备输出目录 ====="
         ls -al ${{ steps.pwd.outputs.workspace-folder }}/arrow/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/
 
-    - name: Upload to Release
+    - name: 自动上传安装包到Release
       uses: softprops/action-gh-release@v1
       with:
         files: |
           ${{ steps.pwd.outputs.workspace-folder }}/arrow/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/*.zip
-        name: ${{ github.event.inputs.DEVICE_NAME }}-${{ github.run_id }}
+        name: ${{ github.event.inputs.DEVICE_NAME }} 编译包-${{ github.run_id }}
         tag_name: ${{ github.run_id }}
         body: |
-          Manifest: ${{ github.event.inputs.MANIFEST_BRANCH }}
-          Device: ${{ github.event.inputs.DEVICE_NAME }}
-          Target: ${{ github.event.inputs.BUILD_TARGET }}
+          源码分支：${{ github.event.inputs.MANIFEST_BRANCH }}
+          设备代号：${{ github.event.inputs.DEVICE_NAME }}
+          编译目标：otapackage
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
