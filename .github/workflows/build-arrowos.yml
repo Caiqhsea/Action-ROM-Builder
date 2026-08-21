@@ -6,7 +6,7 @@ on:
       MIRROR:
         description: 镜像源选择 ustc(中科大) / tuna(清华)
         required: true
-        default: ustc
+        default: tuna
         type: choice
         options:
           - ustc
@@ -67,112 +67,116 @@ jobs:
         run: |
           sudo apt update -y
           sudo apt install git ccache python3 openssl curl -y
-          # 彻底放开git安全路径拦截
+          # 放开git拦截
           git config --global core.protectNTFS false
           git config --global safe.directory "*"
           git config --global core.longpaths true
 
-          # 镜像地址修正
+          # 镜像环境变量
           if [[ "${{ github.event.inputs.MIRROR }}" == "ustc" ]]; then
-            export REPO_DL=https://mirrors.ustc.edu.cn/git/git-repo/repo
             export AOSP_MIRROR=https://mirrors.ustc.edu.cn/aosp/
             export REPO_URL=https://mirrors.ustc.edu.cn/git/git-repo
           else
-            export REPO_DL=https://mirrors.tuna.tsinghua.edu.cn/git/git-repo
             export AOSP_MIRROR=https://mirrors.tuna.tsinghua.edu.cn/git/AOSP/
             export REPO_URL=https://mirrors.tuna.tsinghua.edu.cn/git/git-repo
           fi
           echo "REPO_URL=$REPO_URL" >> $GITHUB_ENV
 
-          # 下载repo工具，3次重试
+          # 统一使用清华repo下载地址（永久可用，无404）
           download_repo(){
             rm -f repo
-            curl -fL $REPO_DL -o repo
+            curl -fL https://mirrors.tuna.tsinghua.edu.cn/git/git-repo/raw/main/repo -o repo
           }
+          # 重试3次下载repo工具
           for i in {1..3}; do
-            if download_repo; then break; fi
+            if download_repo; then
+              echo "repo工具下载成功"
+              break
+            fi
             echo "repo工具下载失败，等待30秒重试"
             sleep 30
           done
+          # 校验文件是否存在，不存在直接退出
+          if [ ! -f repo ]; then
+            echo "三次下载repo全部失败，终止构建"
+            exit 1
+          fi
           chmod +x repo
           sudo mv repo /usr/local/bin/
 
-          # AOSP源码镜像转发
+          # AOSP源码替换镜像
           git config --global user.name "CI Builder"
           git config --global user.email "builder@action.local"
           git config --global url."$AOSP_MIRROR".insteadOf https://android.googlesource.com/
           echo "export REPO_URL=$REPO_URL" >> ~/.bashrc
         working-directory: ${{ env.workspace-folder }}
 
-      - name: 初始化&同步源码（无额外参数，规避git拦截）
+      - name: 初始化&同步源码（规避git参数拦截）
         run: |
           export REPO_URL=${{ env.REPO_URL }}
           SYNC_URL="${{ github.event.inputs.SYNC_URL }}"
           BRANCH="${{ github.event.inputs.MANIFEST_BRANCH }}"
 
           echo "Manifest地址: $SYNC_URL"
-          echo "分支: $BRANCH"
+          echo "源码分支: $BRANCH"
 
           cd ${{ env.workspace-folder }}
           rm -rf arrow
           mkdir arrow
           cd arrow
 
-          # 单独变量赋值，保证参数能正常传入repo init
           repo init -u "$SYNC_URL"
           cd .repo/manifests
           git checkout "$BRANCH"
           cd ../../
 
-          # 加载本地设备树xml
+          # 加载本地设备树清单
           mkdir -p .repo/local_manifests
           cp -f ../../repo-tmp/local_manifests/roomservice.xml .repo/local_manifests/
 
-          # 5次同步重试，单线程防限流
+          # 同步重试机制
           MAX_RETRY=5
           for ((i=1; i<=MAX_RETRY; i++)); do
-            echo "===== 第$i次源码同步尝试 ====="
+            echo "===== 第$i次源码同步 ====="
             repo sync -j1 --force-sync --no-tags --no-clone-bundle --retry-fetches=15
             if [ $? -eq 0 ]; then
-              echo "✅ 同步命令执行完成"
+              echo "✅ 源码同步完成"
               break
             fi
-            echo "同步失败，等待90秒冷却后重试"
+            echo "同步失败，等待90s重试"
             sleep 90
           done
 
-          # 校验源码完整性，防止build/envsetup.sh缺失
-          echo "当前源码根目录文件列表："
+          # 校验源码完整性
           ls -la
           if [ ! -f build/envsetup.sh ]; then
-            echo "❌ 致命错误：源码不完整，缺少 build/envsetup.sh"
+            echo "❌ 源码缺失 build/envsetup.sh"
             exit 1
           fi
-          echo "✅ 源码完整性校验通过"
+          echo "✅ 源码校验通过"
 
-      - name: 分配12G Swap 内存，防止编译OOM崩溃
+      - name: 分配12G Swap，防止编译内存溢出
         uses: pierotofy/set-swap-space@master
         with:
           swap-size-gb: 12
 
-      - name: 编译ROM（低并发j4）
+      - name: 编译ROM
         run: |
           cd ${{ env.workspace-folder }}/arrow
-          ls -la
           source build/envsetup.sh
           lunch ${{ github.event.inputs.LUNCH_TARGET }}
           m otapackage -j4
 
-      - name: 列出编译输出刷机包
+      - name: 列出刷机包
         run: ls ${{ env.workspace-folder }}/arrow/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/*.zip
 
-      - name: 自动发布构建包Release
+      - name: 自动发布Release
         uses: softprops/action-gh-release@v1
         with:
           files: ${{ env.workspace-folder }}/arrow/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/*.zip
           tag_name: build-${{ github.event.inputs.MIRROR }}-${{ github.run_id }}
           name: ${{ github.event.inputs.DEVICE_NAME }} Android12 构建 #${{ github.run_id }}
           body: |
-            构建镜像源：${{ github.event.inputs.MIRROR == 'ustc' && '中科大USTC' || '清华TUNA' }}
-            设备代号：${{ github.event.inputs.DEVICE_NAME }}
-            源码分支：${{ github.event.inputs.MANIFEST_BRANCH }}
+            镜像源：${{ github.event.inputs.MIRROR == 'ustc' && '中科大USTC' || '清华TUNA' }}
+            设备：${{ github.event.inputs.DEVICE_NAME }}
+            分支：${{ github.event.inputs.MANIFEST_BRANCH }}
