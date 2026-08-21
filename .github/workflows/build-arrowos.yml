@@ -63,51 +63,25 @@ jobs:
           distribution: temurin
           java-version: 11
 
-      - name: 安装依赖 + 修复repo下载（解决404）
+      - name: 安装依赖 & apt安装repo（无curl 404问题）
         run: |
           sudo apt update -y
-          sudo apt install git ccache python3 openssl curl -y
+          # 直接通过apt官方源安装repo，完全避开curl下载链接失效问题
+          sudo apt install git ccache python3 openssl curl repo -y
+          
           git config --global core.protectNTFS false
           git config --global safe.directory "*"
           git config --global core.longpaths true
+          git config --global user.name "CI Builder"
+          git config --global user.email "builder@action.local"
 
-          # AOSP镜像地址（只替换源码下载，不影响repo脚本）
+          # AOSP国内镜像加速
           if [[ "${{ github.event.inputs.MIRROR }}" == "ustc" ]]; then
             export AOSP_MIRROR=https://mirrors.ustc.edu.cn/aosp/
           else
             export AOSP_MIRROR=https://mirrors.tuna.tsinghua.edu.cn/git/AOSP/
           fi
           git config --global url."$AOSP_MIRROR".insteadOf https://android.googlesource.com/
-
-          # 全新稳定下载函数，删除失效404国内repo地址
-          download_repo(){
-            rm -f repo
-            # 线路1：jsdelivr加速github（最稳）
-            echo "=== 尝试Jsdelivr下载repo ==="
-            for t in {1..5}; do
-              curl -fL https://cdn.jsdelivr.net/gh/GerritCodeReview/git-repo/stable/repo -o repo
-              [ -f repo ] && return 0
-              sleep 5
-            done
-            rm -f repo
-
-            # 线路2：谷歌官方源兜底
-            echo "=== 尝试谷歌官方repo ==="
-            for t in {1..5}; do
-              curl -fL https://gerrit.googlesource.com/git-repo/raw/stable/repo -o repo
-              [ -f repo ] && return 0
-              sleep 5
-            done
-            echo "repo下载全部失败"
-            exit 1
-          }
-
-          download_repo
-          chmod +x repo
-          sudo mv repo /usr/local/bin/
-
-          git config --global user.name "CI Builder"
-          git config --global user.email "builder@action.local"
         working-directory: ${{ env.workspace-folder }}
 
       - name: 初始化+同步源码
