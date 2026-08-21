@@ -61,28 +61,43 @@ jobs:
           distribution: temurin
           java-version: 11
 
-      - name: 安装依赖 & 移除全部镜像映射，纯原生直连
+      - name: 安装依赖 & 多备用地址下载repo，无国内镜像/代理
         run: |
           sudo apt update -y
           sudo apt install git ccache python3 openssl curl -y
-          # 官方谷歌repo脚本，不用中科大repo镜像
-          curl https://storage.googleapis.com/git-repo-downloads/repo > repo
+          # 多备用官方地址循环下载repo，解决curl exit code 5
+          download_repo() {
+            rm -f repo
+            # 谷歌官方备用域名，无国内中转
+            curl -fL https://gerrit.googlesource.com/git-repo/+/refs/heads/main/repo?format=TEXT | base64 -d > repo
+          }
+          MAX_DL=3
+          for ((i=1; i<=MAX_DL; i++)); do
+            echo "尝试第$i次下载repo工具"
+            if download_repo; then
+              break
+            fi
+            echo "下载失败，等待30秒重试"
+            sleep 30
+          done
+          if [ ! -f repo ]; then
+            echo "repo工具下载多次失败，终止任务"
+            exit 1
+          fi
           chmod a+x repo
           sudo mv repo /usr/local/bin/
-          # git基础配置
+          # git基础配置，彻底清空中科大镜像映射
           git config --global user.name "CI Builder"
           git config --global user.email "ci@build.local"
-          # 关键：删除所有中科大aosp镜像替换规则，完全原生访问谷歌源
-          git config --global --unset-all url."https://mirrors.ustc.edu.cn/aosp/".insteadOf
-          # 编译缓存配置
+          git config --global --unset-all url."https://mirrors.ustc.edu.cn/aosp/".insteadOf || true
+          # ccache编译缓存
           mkdir -p ${{ env.workspace-folder }}/ccache
           echo "export USE_CCACHE=1" >> ~/.bashrc
           echo "export CCACHE_DIR=${{ env.workspace-folder }}/ccache" >> ~/.bashrc
           ccache -M 50G
         working-directory: ${{ env.workspace-folder }}
 
-      # 纯官方谷歌源同步，单线程+超长冷却重试，规避谷歌限流
-      - name: 初始化&同步源码（纯原生谷歌源，无任何国内镜像代理）
+      - name: 初始化&同步源码（纯谷歌原生源，单线程低压力）
         run: |
           cd ${{ env.workspace-folder }}
           mkdir -p arrow
@@ -94,7 +109,6 @@ jobs:
           MAX_RETRY=5
           for ((i=1; i<=MAX_RETRY; i++)); do
             echo "==================== 第$i次同步尝试 ===================="
-            # j1单线程最小压力，内部自动重试15次
             repo sync -j1 --force-sync --no-tags --no-clone-bundle --retry-fetches=15
             if [ $? -eq 0 ]; then
               echo "✅ 源码同步完成"
