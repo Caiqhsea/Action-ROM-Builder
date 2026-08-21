@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest>
+    <project name="sm4450-development/device_xiaomi_sky" path="device/xiaomi/sky" remote="github" revision="16"/>
+    <project name="SM4450/android_kernel_xiaomi_sm4450" path="kernel/xiaomi/sm4450" remote="github" revision="16"/>
+    <project name="TheMuppets/proprietary_vendor_xiaomi" path="vendor/xiaomi" remote="github"/>
+</manifest>
