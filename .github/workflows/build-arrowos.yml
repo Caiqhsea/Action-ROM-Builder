@@ -34,15 +34,11 @@ jobs:
     timeout-minutes: 600
 
     steps:
-      # ============================================================
       # 0. 检出仓库（包含 local_manifests/roomservice.xml）
-      # ============================================================
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ============================================================
-      # 1. 释放磁盘空间（GitHub runner 约 14GB 可用，AOSP 需要更多）
-      # ============================================================
+      # 1. 释放磁盘空间
       - name: Free disk space
         run: |
           sudo rm -rf /usr/share/dotnet
@@ -52,196 +48,126 @@ jobs:
           sudo apt-get clean
           df -h
 
-      # ============================================================
-      # 2. 配置 12G swap，防止编译时 OOM
-      #    修复点：
-      #    - 不使用 fallocate（GitHub runner 上可能报 "Text file busy"）
-      #    - 不依赖 pierotofy/set-swap-space 第三方 action
-      #    - 用 dd 创建 swap 文件，兼容性更好
-      #    - 先 swapoff -a 关闭已有 swap，再 rm 清理旧文件
-      #    - /swapfile 失败时兜底到 /mnt/swapfile（数据盘空间更大）
-      # ============================================================
+      # 2. 配置12G Swap，彻底规避fallocate占用报错
       - name: Configure 12GB swap (dd with /mnt fallback)
         run: |
-          # 关闭所有已有 swap（忽略错误）
           sudo swapoff -a || true
-
-          # 清理可能残留的旧 swap 文件
           sudo rm -f /swapfile /mnt/swapfile
-
           SWAP_FILE=""
-
-          # 优先在根分区创建 swap
-          echo "Attempting to create swap at /swapfile ..."
+          echo "尝试根分区创建swap..."
           if sudo dd if=/dev/zero of=/swapfile bs=1M count=12288 status=progress; then
             SWAP_FILE="/swapfile"
-            echo "Successfully created /swapfile"
           else
-            echo "dd on /swapfile failed, falling back to /mnt/swapfile ..."
             sudo rm -f /swapfile
             sudo dd if=/dev/zero of=/mnt/swapfile bs=1M count=12288 status=progress
             SWAP_FILE="/mnt/swapfile"
-            echo "Successfully created /mnt/swapfile"
           fi
-
-          # 设置权限、格式化、启用
           sudo chmod 600 "$SWAP_FILE"
           sudo mkswap "$SWAP_FILE"
           sudo swapon "$SWAP_FILE"
-
-          echo "Swap configured at: $SWAP_FILE"
+          echo "Swap文件：$SWAP_FILE"
           free -h
 
-      # ============================================================
-      # 3. 安装 JDK 11（Android 12 / API 31-32 要求 JDK 11）
-      # ============================================================
+      # 3. JDK11 安卓12强制依赖
       - name: Setup JDK 11
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '11'
 
-      # ============================================================
-      # 4. 安装编译依赖 + repo 工具
-      #    修复点：
-      #    - 不使用 curl 直链下载 repo（清华/中科大/谷歌地址均可能 404/400）
-      #    - 优先 apt install repo；找不到时用 ppa:git-core/ppa 兜底
-      #    - repo 脚本安装与 AOSP 源码镜像完全分离
-      # ============================================================
+      # 4. 核心修复：兼容Ubuntu24.04安装ncurses5旧库，解决找不到包报错
       - name: Install build dependencies and repo
         run: |
+          # 加入Ubuntu22.04源，提供ncurses5兼容库
+          echo "deb http://archive.ubuntu.com/ubuntu jammy main universe" | sudo tee /etc/apt/sources.list.d/jammy.list
           sudo apt-get update
+
+          # 完整编译依赖，强制安装ncurses5兼容包
           sudo apt-get install -y \
             git-core gnupg flex bison build-essential zip curl \
-            zlib1g-dev libc6-dev-i386 libncurses5 lib32ncurses5-dev \
+            zlib1g-dev libc6-dev-i386 libncurses6 libncurses5 lib32ncurses5-dev \
             x11proto-core-dev libx11-dev lib32z1-dev libgl1-mesa-dev \
-            libxml2-utils xsltproc unzip fontconfig ccache rsync
+            libxml2-utils xsltproc unzip fontconfig ccache rsync --allow-downgrades
 
-          # 安装 repo 工具：优先 apt，兜底 PPA
+          # repo工具安装兜底逻辑，彻底规避curl下载404
           if ! sudo apt-get install -y repo; then
-            echo "apt repo not found, adding ppa:git-core/ppa..."
+            echo "apt无repo包，添加git-core PPA"
             sudo add-apt-repository -y ppa:git-core/ppa
             sudo apt-get update
             sudo apt-get install -y repo
           fi
 
-          echo "repo version:"
           repo version
-          echo "git version:"
           git --version
 
-      # ============================================================
-      # 5. 配置 git 身份（repo 要求）
-      # ============================================================
+      # 5. Git全局配置
       - name: Configure git
         run: |
           git config --global user.name "GitHub Actions"
           git config --global user.email "actions@github.com"
           git config --global color.ui false
+          git config --global core.longpaths true
+          git config --global safe.directory "*"
 
-      # ============================================================
-      # 6. 初始化 repo
-      #    修复点：
-      #    - 不使用 -b 参数（避免 git "strange pathname '-b' blocked" 安全拦截）
-      #    - 不使用 --no-repo-verify（避免被 git 拦截为 strange pathname）
-      #    - init 完成后手动进入 .repo/manifests 执行 git fetch + checkout
-      #    - 所有输入参数使用 github.event.inputs.XXX（不是 github.inputs.XXX）
-      # ============================================================
+      # 6. Repo初始化，规避-b参数拦截问题
       - name: Repo init (without -b to avoid git pathname block)
         run: |
           mkdir -p "$BUILD_DIR"
           cd "$BUILD_DIR"
-
-          # 关键：不传 -b，不传 --no-repo-verify
           repo init -u "${{ github.event.inputs.manifest_url }}" --depth=1
-
-          # init 后手动切换 manifest 分支
           cd .repo/manifests
           git fetch origin "${{ github.event.inputs.branch }}"
           git checkout "${{ github.event.inputs.branch }}"
-          echo "Manifest branch:"
-          git branch --show-current
+          echo "当前Manifest分支：$(git branch --show-current)"
 
-      # ============================================================
-      # 7. 复制设备 local_manifests（roomservice.xml）
-      #    仓库根目录的 local_manifests/roomservice.xml 会被复制到
-      #    .repo/local_manifests/，repo sync 时会自动拉取设备相关仓库
-      # ============================================================
+      # 7. 复制设备roomservice.xml本地清单
       - name: Copy local manifests
         run: |
           if [ -d "${{ github.workspace }}/local_manifests" ]; then
             mkdir -p "$BUILD_DIR/.repo/local_manifests"
             cp -v "${{ github.workspace }}/local_manifests/"*.xml "$BUILD_DIR/.repo/local_manifests/"
-            echo "Local manifests copied:"
             ls -la "$BUILD_DIR/.repo/local_manifests/"
           else
-            echo "WARNING: local_manifests/ not found in repo root!"
-            echo "Ensure local_manifests/roomservice.xml exists for device ${{ github.event.inputs.device }}"
+            echo "警告：仓库根目录未找到local_manifests文件夹，请确认roomservice.xml存在"
           fi
 
-      # ============================================================
-      # 8. 应用 AOSP 源码镜像加速（仅替换源码地址，不涉及 repo 脚本）
-      #    修复点：repo 脚本下载与源码镜像分离，此处只改 default.xml 中的
-      #    android.googlesource.com 地址
-      # ============================================================
+      # 8. AOSP国内镜像加速
       - name: Apply AOSP mirror
         run: |
           cd "$BUILD_DIR"
           MIRROR="${{ github.event.inputs.aosp_mirror }}"
-
           if [ "$MIRROR" = "tuna" ]; then
-            echo "Using Tsinghua TUNA mirror..."
-            find .repo/manifests -name "*.xml" -exec sed -i \
-              's|https://android.googlesource.com|https://mirrors.tuna.tsinghua.edu.cn/git/AOSP|g' {} +
+            find .repo/manifests -name "*.xml" -exec sed -i 's|https://android.googlesource.com|https://mirrors.tuna.tsinghua.edu.cn/git/AOSP|g' {} +
           elif [ "$MIRROR" = "ustc" ]; then
-            echo "Using USTC mirror..."
-            find .repo/manifests -name "*.xml" -exec sed -i \
-              's|https://android.googlesource.com|https://mirrors.ustc.edu.cn/aosp|g' {} +
+            find .repo/manifests -name "*.xml" -exec sed -i 's|https://android.googlesource.com|https://mirrors.ustc.edu.cn/aosp|g' {} +
           else
-            echo "Using official AOSP source (no mirror)."
+            echo "使用官方AOSP源"
           fi
-
-          echo "Manifest fetch URLs:"
           grep -r "fetch=" .repo/manifests/*.xml | head -20 || true
 
-      # ============================================================
-      # 9. 同步源码（带 3 次重试 + 同步后校验 build/envsetup.sh）
-      #    修复点：
-      #    - 至少 3 次重试，应对网络抖动
-      #    - 同步后必须校验 build/envsetup.sh 存在，避免源码不完整
-      # ============================================================
+      # 9. 源码同步，3次自动重试
       - name: Repo sync (with 3 retries and integrity check)
         run: |
           cd "$BUILD_DIR"
-
           for i in 1 2 3; do
-            echo "=========================================="
-            echo "Repo sync attempt $i / 3"
-            echo "=========================================="
+            echo "===== 第$i次同步源码 ====="
             if repo sync -c -j4 --force-sync --no-tags --no-clone-bundle; then
-              echo "Sync succeeded on attempt $i"
+              echo "同步成功"
               break
             fi
             if [ "$i" -eq 3 ]; then
-              echo "ERROR: repo sync failed after 3 attempts!"
+              echo "3次同步全部失败，退出"
               exit 1
             fi
-            echo "Sync attempt $i failed, retrying in 30 seconds..."
+            echo "同步失败，等待30秒重试"
             sleep 30
           done
-
-          # 关键校验：源码同步完整性
           if [ ! -f "build/envsetup.sh" ]; then
-            echo "ERROR: build/envsetup.sh not found! Source sync is incomplete."
-            echo "Contents of build/ directory:"
-            ls -la build/ 2>/dev/null || echo "build/ does not exist"
+            echo "源码不完整，缺少build/envsetup.sh"
             exit 1
           fi
-          echo "Source integrity verified: build/envsetup.sh exists."
 
-      # ============================================================
-      # 10. 配置 ccache（加速重复编译）
-      # ============================================================
+      # 10. Ccache编译缓存加速
       - name: Setup ccache
         run: |
           mkdir -p "$CCACHE_DIR"
@@ -249,48 +175,35 @@ jobs:
           export CCACHE_EXEC=$(which ccache)
           ccache -M 50G
           ccache -z
-          echo "ccache configured."
 
-      # ============================================================
-      # 11. 编译 ArrowOS
-      #     顺序严格：source build/envsetup.sh → lunch → m otapackage -j4
-      # ============================================================
+      # 11. 编译ROM
       - name: Build ArrowOS
         run: |
           cd "$BUILD_DIR"
           export USE_CCACHE=1
           export CCACHE_EXEC=$(which ccache)
           export CCACHE_DIR="$CCACHE_DIR"
-
-          # 严格按顺序执行
           source build/envsetup.sh
           lunch "${{ github.event.inputs.lunch_target }}"
           m otapackage -j4
 
-      # ============================================================
-      # 12. 查找编译产物 zip
-      # ============================================================
+      # 12. 检索编译输出刷机包
       - name: Find output OTA zip
         id: find_zip
         run: |
           DEVICE="${{ github.event.inputs.device }}"
           ZIP_PATH=$(find "$BUILD_DIR/out/target/product/$DEVICE" -maxdepth 1 -name "*.zip" -type f | head -1)
-
           if [ -z "$ZIP_PATH" ]; then
-            echo "ERROR: No OTA zip found in out/target/product/$DEVICE/"
-            ls -la "$BUILD_DIR/out/target/product/$DEVICE/" 2>/dev/null || echo "Product dir not found"
+            echo "未找到OTA刷机包"
+            ls -la "$BUILD_DIR/out/target/product/$DEVICE/" 2>/dev/null
             exit 1
           fi
-
           echo "zip_path=$ZIP_PATH" >> "$GITHUB_OUTPUT"
-          ZIP_NAME=$(basename "$ZIP_PATH")
-          echo "zip_name=$ZIP_NAME" >> "$GITHUB_OUTPUT"
-          echo "Found OTA package: $ZIP_PATH"
+          echo "zip_name=$(basename "$ZIP_PATH")" >> "$GITHUB_OUTPUT"
+          echo "找到刷机包：$ZIP_PATH"
           ls -lh "$ZIP_PATH"
 
-      # ============================================================
-      # 13. 上传 zip 到 GitHub Release
-      # ============================================================
+      # 13. 自动发布Release
       - name: Upload OTA zip to Release
         uses: softprops/action-gh-release@v2
         with:
@@ -298,11 +211,11 @@ jobs:
           name: ArrowOS ${{ github.event.inputs.device }} (${{ github.event.inputs.branch }}) #${{ github.run_number }}
           files: ${{ steps.find_zip.outputs.zip_path }}
           body: |
-            ## ArrowOS Build
-            - **Device**: ${{ github.event.inputs.device }}
-            - **Branch**: ${{ github.event.inputs.branch }}
-            - **Lunch**: ${{ github.event.inputs.lunch_target }}
-            - **Build number**: ${{ github.run_number }}
-            - **Commit**: ${{ github.sha }}
+            ## ArrowOS 编译包
+            - 设备代号：${{ github.event.inputs.device }}
+            - 源码分支：${{ github.event.inputs.branch }}
+            - Lunch编译目标：${{ github.event.inputs.lunch_target }}
+            - 构建编号：${{ github.run_number }}
+            - 仓库提交哈希：${{ github.sha }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
