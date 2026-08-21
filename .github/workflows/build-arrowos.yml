@@ -30,6 +30,12 @@ jobs:
     permissions:
       contents: write
     steps:
+    # 新增检出当前仓库，直接读取roomservice，不用重新克隆
+    - name: Checkout current repo files
+      uses: actions/checkout@v4
+      with:
+        path: repo-tmp
+
     - name: 校验仓库所有者
       if: github.event.repository.owner.login == github.event.sender.login
       run: echo "校验通过，仓库所有者操作"
@@ -50,10 +56,10 @@ jobs:
         echo "workspace-folder=$(pwd)" >> $GITHUB_OUTPUT
       id: pwd
       
-    - name: 配置Java22
+    - name: 配置Java22（稳定temurin）
       uses: actions/setup-java@v4
       with:
-        distribution: 'oracle'
+        distribution: 'temurin'
         java-version: 22
       
     - name: 安装编译依赖 & 配置repo/ccache
@@ -71,14 +77,12 @@ jobs:
     - name: 初始化源码 + 加载roomservice清单同步设备源码
       run: |
         cd ${{ steps.pwd.outputs.workspace-folder }}
-        # 克隆当前仓库，读取仓库内的roomservice.xml清单文件
-        git clone https://github.com/${{ github.repository }} repo-tmp
         mkdir arrow
         cd arrow
         repo init -u ${{ github.event.inputs.SYNC_URL }} -b ${{ github.event.inputs.MANIFEST_BRANCH }}
         # 创建本地清单目录并拷贝roomservice
         mkdir -p .repo/local_manifests
-        cp ../repo-tmp/local_manifests/roomservice.xml .repo/local_manifests/
+        cp ../../repo-tmp/local_manifests/roomservice.xml .repo/local_manifests/
         # 多线程快速同步源码，增加防冲突/提速参数
         repo sync -j$(nproc) --force-sync --no-tags --no-clone-bundle
       working-directory: ${{ steps.pwd.outputs.workspace-folder }}
