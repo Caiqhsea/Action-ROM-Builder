@@ -97,10 +97,14 @@ jobs:
           git config --global color.ui false
           git config --global core.longpaths true
           git config --global safe.directory "*"
-          # 降低git超时，网络差快速失败
-          git config --global http.timeout 10
+          # 使用GITHUB_TOKEN避免API限流
+          git config --global url."https://${{ secrets.GITHUB_TOKEN }}@github.com/".insteadOf https://github.com/
+          # 设置合理的超时
+          git config --global http.timeout 30
+          git config --global http.lowSpeedLimit 1000
+          git config --global http.lowSpeedTime 30
 
-      # 6. Repo初始化逻辑：先官方原生源，2秒超时立刻切国内repo
+      # 6. Repo初始化
       - name: Repo init (先官方直连，失败切换国内镜像)
         run: |
           OFFICIAL_REPO=https://gerrit.googlesource.com/git-repo
@@ -114,7 +118,7 @@ jobs:
           else
             echo "官方直连超时，切换清华repo镜像"
             export REPO_URL=$TUNA_REPO
-            # 全局强制替换谷歌AOSP域名，拦截所有git谷歌请求
+            # 全局强制替换谷歌AOSP域名
             git config --global url."https://mirrors.tuna.tsinghua.edu.cn/git/AOSP/".insteadOf https://android.googlesource.com/
             git config --global url."https://mirrors.tuna.tsinghua.edu.cn/git/AOSP/".insteadOf git://android.googlesource.com/
             if ! curl --connect-timeout 2 -sI $TUNA_REPO > /dev/null; then
@@ -127,25 +131,55 @@ jobs:
 
           mkdir -p "$BUILD_DIR"
           cd "$BUILD_DIR"
-          repo init -u "${{ github.event.inputs.manifest_url }}" --depth=1 --no-repo-verify
-          cd .repo/manifests
-          git fetch origin "${{ github.event.inputs.branch }}"
-          git checkout "${{ github.event.inputs.branch }}"
-          echo "当前Manifest分支：$(git branch --show-current)"
+          
+          # 【修复】添加 -b 参数指定分支，移除 --depth=1
+          repo init -u "${{ github.event.inputs.manifest_url }}" -b "${{ github.event.inputs.branch }}" --no-repo-verify
+          
+          echo "当前Manifest分支：$(cd .repo/manifests && git branch --show-current)"
 
-      # 7. 导入设备本地清单
-      - name: Copy local manifests
+      # 7. 导入设备本地清单并应用镜像
+      - name: Copy and fix local manifests
         run: |
+          cd "$BUILD_DIR"
+          mkdir -p .repo/local_manifests
+          
           if [ -d "${{ github.workspace }}/local_manifests" ]; then
-            mkdir -p "$BUILD_DIR/.repo/local_manifests"
-            cp -v "${{ github.workspace }}/local_manifests/"*.xml "$BUILD_DIR/.repo/local_manifests/"
-            ls -la "$BUILD_DIR/.repo/local_manifests/"
-          else
-            echo "警告：未检测到local_manifests文件夹"
+            cp -v "${{ github.workspace }}/local_manifests/"*.xml .repo/local_manifests/
           fi
+          
+          # 【修复】对local_manifests也应用AOSP镜像替换
+          if [ -f ".repo/local_manifests/roomservice.xml" ]; then
+            echo "===== 原始roomservice.xml ====="
+            cat .repo/local_manifests/roomservice.xml
+            
+            # 替换AOSP源为清华镜像（如果有）
+            sed -i 's|https://android.googlesource.com|https://mirrors.tuna.tsinghua.edu.cn/git/AOSP|g' .repo/local_manifests/roomservice.xml
+            sed -i 's|git://android.googlesource.com|https://mirrors.tuna.tsinghua.edu.cn/git/AOSP|g' .repo/local_manifests/roomservice.xml
+            
+            echo "===== 修复后的roomservice.xml ====="
+            cat .repo/local_manifests/roomservice.xml
+          else
+            echo "警告：未找到roomservice.xml"
+            # 如果设备是sky且没有roomservice，创建默认的
+            if [ "${{ github.event.inputs.device }}" == "sky" ]; then
+              cat > .repo/local_manifests/roomservice.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest>
+              <project name="ArrowOS-Devices/android_kernel_xiaomi_sky"
+                       path="kernel/xiaomi/sky"
+                       remote="github"
+                       revision="5.10-stable"/>
+          </manifest>
+          EOF
+              echo "已创建默认roomservice.xml"
+            fi
+          fi
+          
+          echo "===== 所有local manifests ====="
+          ls -la .repo/local_manifests/
 
-      # 8. AOSP源码镜像：2秒检测官方源，不通切清华
-      - name: Apply AOSP mirror (先原生官方直连，失败切换国内源)
+      # 8. AOSP源码镜像替换
+      - name: Apply AOSP mirror
         run: |
           cd "$BUILD_DIR"
           OFFICIAL_AOSP=https://android.googlesource.com
@@ -156,37 +190,78 @@ jobs:
           if curl --connect-timeout 2 -sI $OFFICIAL_AOSP > /dev/null; then
             echo "官方AOSP直连正常，保留原生地址不替换"
           else
-            echo "官方直连超时无法访问，二次替换清单xml为清华镜像"
-            find .repo/manifests -name "*.xml" -exec sed -i "s|$OFFICIAL_AOSP|$TUNA_AOSP|g" {} +
+            echo "官方直连超时无法访问，替换所有清单xml为清华镜像"
+            # 【修复】替换所有.repo目录下的xml，包括local_manifests
+            find .repo -name "*.xml" -type f -exec sed -i "s|$OFFICIAL_AOSP|$TUNA_AOSP|g" {} +
             if ! curl --connect-timeout 2 -sI $TUNA_AOSP > /dev/null; then
               echo "清华镜像不可用，降级中科大AOSP"
-              find .repo/manifests -name "*.xml" -exec sed -i "s|$TUNA_AOSP|$USTC_AOSP|g" {} +
+              find .repo -name "*.xml" -type f -exec sed -i "s|$TUNA_AOSP|$USTC_AOSP|g" {} +
             fi
           fi
-          echo "清单fetch地址预览："
-          grep -r "fetch=" .repo/manifests/*.xml | head -10 || true
+          
+          echo "===== 清单fetch地址预览 ====="
+          echo "主manifest:"
+          grep -r "fetch=" .repo/manifests/*.xml 2>/dev/null | head -5 || true
+          echo "local_manifests:"
+          grep -r "fetch=" .repo/local_manifests/*.xml 2>/dev/null | head -5 || true
 
-      # 9. 高速稳定同步源码，降低并发+自动重试
-      - name: Repo sync (高速并发同步)
+      # 9. Repo sync (增强重试版)
+      - name: Repo sync
         run: |
           cd "$BUILD_DIR"
-          for i in 1 2 3; do
+          
+          # 清理可能的锁文件
+          rm -f .repo/project.list .repo/local_manifests/.cache 2>/dev/null || true
+          
+          for i in 1 2 3 4 5; do
             echo "===== 第$i次同步源码 ====="
-            if repo sync -c -j6 --force-sync --no-tags --no-clone-bundle --prune --optimized-fetch --retry-fetches 5; then
-              echo "源码同步完成！"
+            echo "开始时间：$(date)"
+            
+            # 【修复】降低并发到-j4，添加--fail-fast快速失败
+            if repo sync -c -j4 --force-sync --no-tags --no-clone-bundle --prune --optimized-fetch --retry-fetches 5 --fail-fast; then
+              echo "✅ 源码同步完成！"
               break
             fi
-            if [ "$i" -eq 3 ]; then
-              echo "三次同步全部失败，终止构建"
+            
+            SYNC_EXIT=$?
+            echo "同步失败，退出码：$SYNC_EXIT"
+            
+            if [ "$i" -eq 5 ]; then
+              echo "❌ 五次同步全部失败，终止构建"
+              
+              # 输出调试信息
+              echo "===== 调试信息 ====="
+              echo "1. 网络连接测试："
+              curl -I --connect-timeout 5 https://github.com 2>&1 | head -3 || echo "GitHub不可达"
+              curl -I --connect-timeout 5 https://mirrors.tuna.tsinghua.edu.cn 2>&1 | head -3 || echo "清华不可达"
+              
+              echo "2. 同步状态："
+              repo status 2>&1 | head -20 || true
+              
+              echo "3. 已下载的项目："
+              find .repo/projects -maxdepth 1 -type d | wc -l
+              
               exit 1
             fi
-            echo "同步失败，等待45秒后重试"
-            sleep 45
+            
+            # 如果是GitHub限流(128)，等待更长时间
+            if [ $SYNC_EXIT -eq 128 ]; then
+              echo "检测到GitHub限流，等待120秒"
+              sleep 120
+            else
+              echo "同步失败，等待60秒后重试"
+              sleep 60
+            fi
           done
+          
+          # 验证同步完整性
           if [ ! -f "build/envsetup.sh" ]; then
-            echo "源码同步不完整，缺少核心文件"
+            echo "❌ 源码同步不完整，缺少核心文件"
+            echo "检查build目录："
+            ls -la build/ 2>/dev/null || echo "build目录不存在"
             exit 1
           fi
+          echo "✅ 源码验证通过"
 
       # 10. 编译缓存配置
       - name: Setup ccache
