@@ -1,136 +1,280 @@
-name: Build ArrowOS Android12
-run-name: Build ${{ github.event.inputs.DEVICE_NAME }} Android12
+name: Build ArrowOS (arrow-12.1)
+
 on:
   workflow_dispatch:
     inputs:
-      MIRROR:
-        description: AOSP镜像源 ustc/ tuna
+      manifest_url:
+        description: 'Manifest repository URL'
         required: true
-        default: tuna
-        type: choice
-        options:
-          - ustc
-          - tuna
-      SYNC_URL:
-        description: Manifest仓库
+        default: 'https://github.com/ArrowOS/android_manifest.git'
+      branch:
+        description: 'Manifest branch (do NOT change)'
         required: true
-        default: https://github.com/ArrowOS/android_manifest.git
-      MANIFEST_BRANCH:
-        description: Android12分支
+        default: 'arrow-12.1'
+      device:
+        description: 'Device codename'
         required: true
-        default: arrow-12.1
-      DEVICE_NAME:
-        description: 设备代号
+        default: 'sky'
+      lunch_target:
+        description: 'Lunch target'
         required: true
-        default: sky
-      LUNCH_TARGET:
-        description: 编译目标
+        default: 'arrow_sky-userdebug'
+      aosp_mirror:
+        description: 'AOSP source mirror: tuna / ustc / official'
         required: true
-        default: arrow_sky-userdebug
+        default: 'tuna'
+
+env:
+  BUILD_DIR: ${{ github.workspace }}/android
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
 
 jobs:
-  build-rom:
+  build:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
+    timeout-minutes: 600
+
     steps:
-      - name: 拉取本地roomservice设备配置
+      # ============================================================
+      # 0. 检出仓库（包含 local_manifests/roomservice.xml）
+      # ============================================================
+      - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          path: repo-tmp
 
-      - name: 清理磁盘空间
+      # ============================================================
+      # 1. 释放磁盘空间（GitHub runner 约 14GB 可用，AOSP 需要更多）
+      # ============================================================
+      - name: Free disk space
         run: |
-          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /var/lib/apt/lists/*
-          sudo apt clean
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo apt-get clean
+          df -h
 
-      - name: 创建编译目录
+      # ============================================================
+      # 2. 配置 12G swap，防止编译时 OOM
+      # ============================================================
+      - name: Configure 12GB swap
         run: |
-          mkdir workspace
-          echo "workspace-folder=$(pwd)/workspace" >> $GITHUB_ENV
+          sudo fallocate -l 12G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          echo "Swap configured:"
+          free -h
 
-      - name: 源码缓存
-        uses: actions/cache@v3
-        with:
-          path: ${{ env.workspace-folder }}/arrow
-          key: arrow-${{ github.event.inputs.MIRROR }}-${{ github.event.inputs.MANIFEST_BRANCH }}
-          restore-keys: |
-            arrow-${{ github.event.inputs.MIRROR }}-
-
-      - name: 安装JDK11
+      # ============================================================
+      # 3. 安装 JDK 11（Android 12 / API 31-32 要求 JDK 11）
+      # ============================================================
+      - name: Setup JDK 11
         uses: actions/setup-java@v4
         with:
-          distribution: temurin
-          java-version: 11
+          distribution: 'temurin'
+          java-version: '11'
 
-      - name: 安装依赖 & apt安装repo（无curl 404问题）
+      # ============================================================
+      # 4. 安装编译依赖 + repo 工具
+      #    修复点：
+      #    - 不使用 curl 直链下载 repo（清华/中科大/谷歌地址均可能 404/400）
+      #    - 优先 apt install repo；找不到时用 ppa:git-core/ppa 兜底
+      #    - repo 脚本安装与 AOSP 源码镜像完全分离
+      # ============================================================
+      - name: Install build dependencies and repo
         run: |
-          sudo apt update -y
-          # 直接通过apt官方源安装repo，完全避开curl下载链接失效问题
-          sudo apt install git ccache python3 openssl curl repo -y
-          
-          git config --global core.protectNTFS false
-          git config --global safe.directory "*"
-          git config --global core.longpaths true
-          git config --global user.name "CI Builder"
-          git config --global user.email "builder@action.local"
+          sudo apt-get update
+          sudo apt-get install -y \
+            git-core gnupg flex bison build-essential zip curl \
+            zlib1g-dev libc6-dev-i386 libncurses5 lib32ncurses5-dev \
+            x11proto-core-dev libx11-dev lib32z1-dev libgl1-mesa-dev \
+            libxml2-utils xsltproc unzip fontconfig ccache rsync
 
-          # AOSP国内镜像加速
-          if [[ "${{ github.event.inputs.MIRROR }}" == "ustc" ]]; then
-            export AOSP_MIRROR=https://mirrors.ustc.edu.cn/aosp/
-          else
-            export AOSP_MIRROR=https://mirrors.tuna.tsinghua.edu.cn/git/AOSP/
+          # 安装 repo 工具：优先 apt，兜底 PPA
+          if ! sudo apt-get install -y repo; then
+            echo "apt repo not found, adding ppa:git-core/ppa..."
+            sudo add-apt-repository -y ppa:git-core/ppa
+            sudo apt-get update
+            sudo apt-get install -y repo
           fi
-          git config --global url."$AOSP_MIRROR".insteadOf https://android.googlesource.com/
-        working-directory: ${{ env.workspace-folder }}
 
-      - name: 初始化+同步源码
+          echo "repo version:"
+          repo version
+          echo "git version:"
+          git --version
+
+      # ============================================================
+      # 5. 配置 git 身份（repo 要求）
+      # ============================================================
+      - name: Configure git
         run: |
-          SYNC_URL="${{ github.event.inputs.SYNC_URL }}"
-          BRANCH="${{ github.event.inputs.MANIFEST_BRANCH }}"
-          cd ${{ env.workspace-folder }}
-          rm -rf arrow
-          mkdir arrow && cd arrow
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+          git config --global color.ui false
 
-          repo init -u "$SYNC_URL" -b "$BRANCH"
+      # ============================================================
+      # 6. 初始化 repo
+      #    修复点：
+      #    - 不使用 -b 参数（避免 git "strange pathname '-b' blocked" 安全拦截）
+      #    - 不使用 --no-repo-verify（避免被 git 拦截为 strange pathname）
+      #    - init 完成后手动进入 .repo/manifests 执行 git fetch + checkout
+      #    - 所有输入参数使用 github.event.inputs.XXX（不是 github.inputs.XXX）
+      # ============================================================
+      - name: Repo init (without -b to avoid git pathname block)
+        run: |
+          mkdir -p "$BUILD_DIR"
+          cd "$BUILD_DIR"
+
+          # 关键：不传 -b，不传 --no-repo-verify
+          repo init -u "${{ github.event.inputs.manifest_url }}" --depth=1
+
+          # init 后手动切换 manifest 分支
           cd .repo/manifests
-          git checkout "$BRANCH"
-          cd ../../
+          git fetch origin "${{ github.event.inputs.branch }}"
+          git checkout "${{ github.event.inputs.branch }}"
+          echo "Manifest branch:"
+          git branch --show-current
 
-          mkdir -p .repo/local_manifests
-          cp -f ../../repo-tmp/local_manifests/roomservice.xml .repo/local_manifests/
-
-          MAX_RETRY=5
-          SUCCESS=0
-          for ((i=1;i<=MAX_RETRY;i++)); do
-            echo "第$i次同步源码"
-            repo sync -j1 --force-sync --no-tags --no-clone-bundle --retry-fetches=10
-            if [ $? -eq 0 ]; then SUCCESS=1;break;fi
-            sleep 20
-          done
-          [ $SUCCESS -ne 1 ] && exit 1
-          [ ! -f build/envsetup.sh ] && exit 1
-
-      - name: 12G虚拟内存
-        uses: pierotofy/set-swap-space@master
-        with:
-          swap-size-gb: 12
-
-      - name: 编译刷机包
+      # ============================================================
+      # 7. 复制设备 local_manifests（roomservice.xml）
+      #    仓库根目录的 local_manifests/roomservice.xml 会被复制到
+      #    .repo/local_manifests/，repo sync 时会自动拉取设备相关仓库
+      # ============================================================
+      - name: Copy local manifests
         run: |
-          cd ${{ env.workspace-folder }}/arrow
+          if [ -d "${{ github.workspace }}/local_manifests" ]; then
+            mkdir -p "$BUILD_DIR/.repo/local_manifests"
+            cp -v "${{ github.workspace }}/local_manifests/"*.xml "$BUILD_DIR/.repo/local_manifests/"
+            echo "Local manifests copied:"
+            ls -la "$BUILD_DIR/.repo/local_manifests/"
+          else
+            echo "WARNING: local_manifests/ not found in repo root!"
+            echo "Ensure local_manifests/roomservice.xml exists for device ${{ github.event.inputs.device }}"
+          fi
+
+      # ============================================================
+      # 8. 应用 AOSP 源码镜像加速（仅替换源码地址，不涉及 repo 脚本）
+      #    修复点：repo 脚本下载与源码镜像分离，此处只改 default.xml 中的
+      #    android.googlesource.com 地址
+      # ============================================================
+      - name: Apply AOSP mirror
+        run: |
+          cd "$BUILD_DIR"
+          MIRROR="${{ github.event.inputs.aosp_mirror }}"
+
+          if [ "$MIRROR" = "tuna" ]; then
+            echo "Using Tsinghua TUNA mirror..."
+            find .repo/manifests -name "*.xml" -exec sed -i \
+              's|https://android.googlesource.com|https://mirrors.tuna.tsinghua.edu.cn/git/AOSP|g' {} +
+          elif [ "$MIRROR" = "ustc" ]; then
+            echo "Using USTC mirror..."
+            find .repo/manifests -name "*.xml" -exec sed -i \
+              's|https://android.googlesource.com|https://mirrors.ustc.edu.cn/aosp|g' {} +
+          else
+            echo "Using official AOSP source (no mirror)."
+          fi
+
+          echo "Manifest fetch URLs:"
+          grep -r "fetch=" .repo/manifests/*.xml | head -20 || true
+
+      # ============================================================
+      # 9. 同步源码（带 3 次重试 + 同步后校验 build/envsetup.sh）
+      #    修复点：
+      #    - 至少 3 次重试，应对网络抖动
+      #    - 同步后必须校验 build/envsetup.sh 存在，避免源码不完整
+      # ============================================================
+      - name: Repo sync (with 3 retries and integrity check)
+        run: |
+          cd "$BUILD_DIR"
+
+          for i in 1 2 3; do
+            echo "=========================================="
+            echo "Repo sync attempt $i / 3"
+            echo "=========================================="
+            if repo sync -c -j4 --force-sync --no-tags --no-clone-bundle; then
+              echo "Sync succeeded on attempt $i"
+              break
+            fi
+            if [ "$i" -eq 3 ]; then
+              echo "ERROR: repo sync failed after 3 attempts!"
+              exit 1
+            fi
+            echo "Sync attempt $i failed, retrying in 30 seconds..."
+            sleep 30
+          done
+
+          # 关键校验：源码同步完整性
+          if [ ! -f "build/envsetup.sh" ]; then
+            echo "ERROR: build/envsetup.sh not found! Source sync is incomplete."
+            echo "Contents of build/ directory:"
+            ls -la build/ 2>/dev/null || echo "build/ does not exist"
+            exit 1
+          fi
+          echo "Source integrity verified: build/envsetup.sh exists."
+
+      # ============================================================
+      # 10. 配置 ccache（加速重复编译）
+      # ============================================================
+      - name: Setup ccache
+        run: |
+          mkdir -p "$CCACHE_DIR"
+          export USE_CCACHE=1
+          export CCACHE_EXEC=$(which ccache)
+          ccache -M 50G
+          ccache -z
+          echo "ccache configured."
+
+      # ============================================================
+      # 11. 编译 ArrowOS
+      #     顺序严格：source build/envsetup.sh → lunch → m otapackage -j4
+      # ============================================================
+      - name: Build ArrowOS
+        run: |
+          cd "$BUILD_DIR"
+          export USE_CCACHE=1
+          export CCACHE_EXEC=$(which ccache)
+          export CCACHE_DIR="$CCACHE_DIR"
+
+          # 严格按顺序执行
           source build/envsetup.sh
-          lunch ${{ github.event.inputs.LUNCH_TARGET }}
+          lunch "${{ github.event.inputs.lunch_target }}"
           m otapackage -j4
 
-      - name: 列出刷机包
-        run: ls ${{ env.workspace-folder }}/arrow/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/*.zip
+      # ============================================================
+      # 12. 查找编译产物 zip
+      # ============================================================
+      - name: Find output OTA zip
+        id: find_zip
+        run: |
+          DEVICE="${{ github.event.inputs.device }}"
+          ZIP_PATH=$(find "$BUILD_DIR/out/target/product/$DEVICE" -maxdepth 1 -name "*.zip" -type f | head -1)
 
-      - name: 发布成品
-        uses: softprops/action-gh-release@v1
-        if: success()
+          if [ -z "$ZIP_PATH" ]; then
+            echo "ERROR: No OTA zip found in out/target/product/$DEVICE/"
+            ls -la "$BUILD_DIR/out/target/product/$DEVICE/" 2>/dev/null || echo "Product dir not found"
+            exit 1
+          fi
+
+          echo "zip_path=$ZIP_PATH" >> "$GITHUB_OUTPUT"
+          ZIP_NAME=$(basename "$ZIP_PATH")
+          echo "zip_name=$ZIP_NAME" >> "$GITHUB_OUTPUT"
+          echo "Found OTA package: $ZIP_PATH"
+          ls -lh "$ZIP_PATH"
+
+      # ============================================================
+      # 13. 上传 zip 到 GitHub Release
+      # ============================================================
+      - name: Upload OTA zip to Release
+        uses: softprops/action-gh-release@v2
         with:
-          files: ${{ env.workspace-folder }}/arrow/out/target/product/${{ env.DEVICE_NAME }}/*.zip
-          tag_name: Arrow12-Build-${{ github.run_number }}
-          name: ArrowOS12 Build ${{ github.run_number }}
-          generate_release_notes: true
+          tag_name: arrowos-${{ github.event.inputs.device }}-${{ github.run_number }}
+          name: ArrowOS ${{ github.event.inputs.device }} (${{ github.event.inputs.branch }}) #${{ github.run_number }}
+          files: ${{ steps.find_zip.outputs.zip_path }}
+          body: |
+            ## ArrowOS Build
+            - **Device**: ${{ github.event.inputs.device }}
+            - **Branch**: ${{ github.event.inputs.branch }}
+            - **Lunch**: ${{ github.event.inputs.lunch_target }}
+            - **Build number**: ${{ github.run_number }}
+            - **Commit**: ${{ github.sha }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
