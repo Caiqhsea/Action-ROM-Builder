@@ -80,7 +80,7 @@ jobs:
           fi
           echo "REPO_URL=$REPO_URL" >> $GITHUB_ENV
 
-          # 三段下载源：清华→中科大→谷歌直连，每个源重试5次，间隔8秒
+          # 四条下载链路：清华→中科大→Jsdelivr加速链→谷歌原生无参数链接，每条5次，间隔8秒
           download_repo(){
             rm -f repo
             # 1.清华镜像 最多5次
@@ -103,20 +103,30 @@ jobs:
             done
             rm -f repo
 
-            # 3.谷歌官方直连 最多5次
-            echo "=== 国内镜像全部失败，切换【谷歌直连】最多5次 ==="
+            # 3.新增Jsdelivr全球加速链（兜底加速）最多5次
+            echo "=== 国内镜像失败，切换【Jsdelivr加速链】最多5次 ==="
+            for t in {1..5}; do
+              echo "Jsdelivr加速第${t}次尝试"
+              curl -fL https://cdn.jsdelivr.net/gh/GerritCodeReview/git-repo@main/repo -o repo
+              if [ -f repo ]; then return 0; fi
+              sleep 8
+            done
+            rm -f repo
+
+            # 4.谷歌官方原生链接（移除?format=RAW 避免400报错）最多5次
+            echo "=== 加速链失败，切换【谷歌原生直连】最多5次 ==="
             for t in {1..5}; do
               echo "谷歌直连第${t}次尝试"
-              curl -fL https://gerrit.googlesource.com/git-repo/+/refs/heads/main/repo?format=RAW -o repo
+              curl -fL https://gerrit.googlesource.com/git-repo/+/refs/heads/main/repo -o repo
               if [ -f repo ]; then return 0; fi
               sleep 8
             done
             return 1
           }
 
-          # 执行下载
+          # 执行下载逻辑
           if ! download_repo; then
-            echo "ERROR：清华/中科大/谷歌直连各5次全部失败，终止构建"
+            echo "ERROR：清华/中科大/Jsdelivr加速/谷歌直连 各5次全部失败，终止构建"
             exit 1
           fi
 
