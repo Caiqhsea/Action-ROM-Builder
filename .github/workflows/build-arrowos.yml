@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       SYNC_URL:
-        description: ArrowOS 源码Manifest仓库
+        description: ArrowOS Manifest仓库
         required: true
         default: https://github.com/ArrowOS/android_manifest.git
       MANIFEST_BRANCH:
-        description: ROM分支（安卓12固定arrow-12.1）
+        description: ROM分支 arrow-12.1
         required: true
         default: arrow-12.1
       DEVICE_NAME:
@@ -30,28 +30,24 @@ jobs:
     permissions:
       contents: write
     steps:
-      # 拉取本地仓库配置（roomservice内核配置）
-      - name: 拉取本地仓库文件
+      - name: 拉取本地roomservice配置
         uses: actions/checkout@v4
         with:
           path: repo-tmp
 
-      # 清理无用文件扩容磁盘
-      - name: 清理无用文件扩容磁盘
+      - name: 深度清理磁盘释放空间
         run: |
-          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /var/lib/apt/lists/*
           sudo apt clean
           df -h
 
-      # 创建工作目录
-      - name: 创建源码工作目录
+      - name: 创建工作目录
         run: |
           mkdir workspace
           cd workspace
           echo "workspace-folder=$(pwd)" >> $GITHUB_ENV
 
-      # 源码缓存优化（移除run_id，复用缓存）
-      - name: 缓存完整源码
+      - name: 缓存源码（同分支复用，减少重复同步）
         uses: actions/cache@v3
         with:
           path: ${{ env.workspace-folder }}/arrow
@@ -59,38 +55,38 @@ jobs:
           restore-keys: |
             arrowos-${{ github.event.inputs.MANIFEST_BRANCH }}
 
-      # Android12 JDK11
-      - name: 配置JDK11
+      - name: 配置JDK11（Android12强制）
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: 11
 
-      # 安装依赖+Repo中科大镜像加速（仅repo工具，不代理源码）
-      - name: 安装系统依赖与Repo工具
+      - name: 安装依赖 & 仅替换AOSP镜像（无GitHub代理）
         run: |
           sudo apt update -y
           sudo apt install git ccache python3 openssl curl -y
-          # 仅repo工具走中科大，源码github不代理
+          # repo工具从中科大下载
           export REPO_URL=https://gerrit-googlesource.proxy.ustclug.org/git-repo
           sudo curl -L -o /usr/local/bin/repo $REPO_URL/repo
           sudo chmod a+x /usr/local/bin/repo
-          # 全局Git基础配置
+          # git基础配置
           git config --global user.name "CI Builder"
           git config --global user.email "ci@build.local"
-          # 【仅修复AOSP 404，无任何github代理】
-          # 完整覆盖android.googlesource两种协议，统一正确中科大地址
+          # 仅映射AOSP谷歌源到中科大，github完全原生不代理
           git config --global url."https://mirrors.ustc.edu.cn/aosp/".insteadOf https://android.googlesource.com/
           git config --global url."https://mirrors.ustc.edu.cn/aosp/".insteadOf git://android.googlesource.com/
-          # Ccache编译缓存
+          # 编译缓存
           mkdir -p ${{ env.workspace-folder }}/ccache
           echo "export USE_CCACHE=1" >> ~/.bashrc
           echo "export CCACHE_DIR=${{ env.workspace-folder }}/ccache" >> ~/.bashrc
           ccache -M 50G
         working-directory: ${{ env.workspace-folder }}
 
-      # 同步源码：浅克隆、低并发、三重重试，纯原生无代理
-      - name: 初始化&同步源码（仅AOSP镜像修复，无第三方代理）
+      # 【根治RESOURCE_EXHAUSTED核心修改】
+      # 1. 并发降至最低 -j1 单线程拉取，杜绝服务器限流
+      # 2. 重试间隔拉长至60秒，给镜像服务器冷却时间
+      # 3. 关闭多余拉取参数，减少网络请求
+      - name: 初始化&同步源码（单线程防资源耗尽，无第三方代理）
         run: |
           cd ${{ env.workspace-folder }}
           mkdir -p arrow
@@ -99,29 +95,28 @@ jobs:
           mkdir -p .repo/local_manifests
           cp ../../repo-tmp/local_manifests/roomservice.xml .repo/local_manifests/
           
-          MAX_RETRY=3
+          MAX_RETRY=4
           for ((i=1; i<=MAX_RETRY; i++)); do
-            echo "==================== 第$i次源码同步尝试 ===================="
-            repo sync -j2 --force-sync --no-tags --no-clone-bundle --verbose --retry-fetches=5
+            echo "==================== 第$i次同步尝试 ===================="
+            # -j1 单线程同步，最低请求压力；retry-fetches=10 单次内部重试10次
+            repo sync -j1 --force-sync --no-tags --no-clone-bundle --retry-fetches=10
             if [ $? -eq 0 ]; then
-              echo "✅ 源码同步全部完成"
+              echo "✅ 源码同步完成"
               exit 0
             fi
-            echo "❌ 仓库访问失败/限流，等待40秒重试"
-            sleep 40
+            echo "❌ 镜像服务器资源耗尽限流，等待60秒冷却后重试"
+            sleep 60
           done
-          echo "❌ 连续3次同步全部失败，终止构建"
+          echo "❌ 4次同步全部失败，任务终止"
           exit 1
         working-directory: ${{ env.workspace-folder }}
 
-      # 12G Swap内存防编译OOM
-      - name: 分配12G Swap交换内存
+      - name: 分配12G Swap 防止内存溢出
         uses: pierotofy/set-swap-space@master
         with:
           swap-size-gb: 12
 
-      # 编译固定-j4，不使用nproc防止内存溢出
-      - name: 编译Android12 ROM
+      - name: 编译ROM（固定低并发j4）
         run: |
           cd ${{ env.workspace-folder }}/arrow
           source build/envsetup.sh
@@ -129,22 +124,18 @@ jobs:
           m otapackage -j4
         working-directory: ${{ env.workspace-folder }}
 
-      # 查看刷机包
-      - name: 查看编译产物
-        run: |
-          ls ${{ env.workspace-folder }}/arrow/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/*.zip
+      - name: 列出刷机包
+        run: ls ${{ env.workspace-folder }}/arrow/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/*.zip
 
-      # 发布Release
-      - name: 发布刷机包到Release
+      - name: 自动发布Release
         uses: softprops/action-gh-release@v1
         with:
           files: ${{ env.workspace-folder }}/arrow/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/*.zip
           tag_name: Build-${{ github.run_id }}
           name: ${{ github.event.inputs.DEVICE_NAME }} Android12 Build #${{ github.run_id }}
           body: |
-            ROM版本：ArrowOS 12.1 (Android 12)
-            内核基线：Linux 5.10 LTS
-            设备代号：${{ github.event.inputs.DEVICE_NAME }}
-            编译类型: userdebug
+            ROM：ArrowOS 12.1 Android12
+            设备：${{ github.event.inputs.DEVICE_NAME }}
+            编译类型：userdebug
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
