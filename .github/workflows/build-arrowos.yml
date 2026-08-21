@@ -30,10 +30,106 @@ jobs:
     permissions:
       contents: write
     steps:
-    # 新增检出当前仓库，直接读取roomservice，不用重新克隆
+    # 检出仓库文件，读取roomservice清单
     - name: Checkout current repo files
       uses: actions/checkout@v4
       with:
+        path: repo-tmp
+
+    - name: 校验仓库所有者
+      if: github.event.repository.owner.login == github.event.sender.login
+      run: echo "校验通过，仓库所有者操作"
+
+    - name: 非所有者禁止运行
+      if: github.event.repository.owner.login != github.event.sender.login
+      run: |
+        echo "仅仓库主人可触发编译"
+        exit 1
+
+    - name: 清理环境
+      uses: rokibhasansagar/slimhub_actions@main
+
+    - name: 创建工作目录
+      run: |
+        mkdir workspace
+        cd workspace
+        echo "workspace-folder=$(pwd)" >> $GITHUB_OUTPUT
+      id: pwd
+
+    # 源码缓存，第二次编译无需完整下载源码
+    - name: 缓存ArrowOS源码
+      uses: actions/cache@v3
+      with:
+        path: ${{ steps.pwd.outputs.workspace-folder }}/arrow
+        key: arrowos-cache-${{ github.event.inputs.MANIFEST_BRANCH }}
+      
+    - name: 配置Java22（稳定temurin）
+      uses: actions/setup-java@v4
+      with:
+        distribution: 'temurin'
+        java-version: 22
+      
+    - name: 安装编译依赖 & 配置repo/ccache
+      run: |
+        cd ${{ steps.pwd.outputs.workspace-folder }}
+        sudo apt install git aria2 ccache -y
+        sudo curl --create-dirs -L -o /usr/local/bin/repo https://storage.googleapis.com/git-repo-downloads/repo
+        sudo chmod a+rx /usr/local/bin/repo
+        mkdir ${{ steps.pwd.outputs.workspace-folder }}/ccache
+        export USE_CCACHE=1
+        export CCACHE_DIR=${{ steps.pwd.outputs.workspace-folder }}/ccache/
+        ccache -M 50G
+      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
+
+    - name: 初始化源码 + 国内镜像加速同步
+      run: |
+        cd ${{ steps.pwd.outputs.workspace-folder }}
+        mkdir -p arrow
+        cd arrow
+        repo init -u ${{ github.event.inputs.SYNC_URL }} -b ${{ github.event.inputs.MANIFEST_BRANCH }}
+        # 拷贝本地设备清单
+        mkdir -p .repo/local_manifests
+        cp ../../repo-tmp/local_manifests/roomservice.xml .repo/local_manifests/
+        # 中科大镜像加速Github & AOSP，解决国内下载慢
+        git config --global url."https://mirrors.ustc.edu.cn/git/".insteadOf https://github.com/
+        git config --global url."https://mirrors.ustc.edu.cn/git/aosp/".insteadOf https://android.googlesource.com/
+        # 限制8线程，避免网络拥堵断连
+        repo sync -j8 --force-sync --no-tags --no-clone-bundle
+      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
+
+    - name: 分配12G交换内存
+      uses: pierotofy/set-swap-space@master
+      with:
+        swap-size-gb: 12
+
+    - name: 编译ArrowOS安装包
+      run: |
+        cd ${{ steps.pwd.outputs.workspace-folder }}/arrow/
+        . build/envsetup.sh
+        lunch ${{ github.event.inputs.MAKEFILE_NAME }}
+        m otapackage
+      working-directory: ${{ steps.pwd.outputs.workspace-folder }}
+      continue-on-error: true
+
+    - name: 查看编译输出文件
+      run: |
+        ls -al ${{ steps.pwd.outputs.workspace-folder }}/arrow/out/target/product/
+        echo "===== 设备输出目录 ====="
+        ls -al ${{ steps.pwd.outputs.workspace-folder }}/arrow/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/
+
+    - name: 自动上传安装包到Release
+      uses: softprops/action-gh-release@v1
+      with:
+        files: |
+          ${{ steps.pwd.outputs.workspace-folder }}/arrow/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/*.zip
+        name: ${{ github.event.inputs.DEVICE_NAME }} 编译包-${{ github.run_id }}
+        tag_name: ${{ github.run_id }}
+        body: |
+          源码分支：${{ github.event.inputs.MANIFEST_BRANCH }}
+          设备代号：${{ github.event.inputs.DEVICE_NAME }}
+          编译目标：otapackage
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         path: repo-tmp
 
     - name: 校验仓库所有者
